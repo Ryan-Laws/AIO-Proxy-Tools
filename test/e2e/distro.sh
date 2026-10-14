@@ -100,7 +100,9 @@ COPY e2e-ips.openrc /etc/init.d/e2e-ips
 RUN chmod 0755 /etc/init.d/e2e-ips \\
  && if command -v rc-update >/dev/null; then rc-update add e2e-ips boot; rm -f /etc/systemd/system/e2e-ips.service; \\
     else systemctl enable e2e-ips; rm -f /etc/init.d/e2e-ips; fi
-RUN ssh-keygen -A \\
+# 容器没有 fstab：EL8 的 systemd-remount-fs 会在重启后把根文件系统重新挂成只读（真实服务器不会）
+RUN (command -v systemctl >/dev/null && systemctl mask systemd-remount-fs.service >/dev/null 2>&1 || true) \\
+ && ssh-keygen -A \\
  && mkdir -p /root/.ssh && chmod 700 /root/.ssh \\
  && echo 'root:$SUDO_PW' | chpasswd \\
  && printf 'PermitRootLogin prohibit-password\nPasswordAuthentication yes\nKbdInteractiveAuthentication yes\n' > /tmp/sshd_extra \\

@@ -241,9 +241,9 @@ Per account. If you want a separate limit for each IP, choose "random account pe
 <details>
 <summary><b>What happens when a traffic quota runs out?</b></summary>
 
-3proxy caps each connection at the remaining quota: HTTP requests that don't fit are refused, and SOCKS5 transfers stop when the quota is reached. A quota guard also runs on the server every minute: accounts with less than 1 MB left are disabled, and re-enabled automatically when the counting period (day / week / month) resets.
+3proxy caps each connection at the remaining quota: HTTP requests that don't fit are refused, SOCKS5 transfers stop when the quota is reached, and once it's used up new connections are refused.
 
-Right at the boundary, an individual connection can occasionally overshoot (observed with 3proxy 1.0.1); the guard disables the account within a minute.
+As a safety net, a quota guard also runs on the server every minute: accounts with less than 1 MB left are disabled, and re-enabled automatically when the counting period (day / week / month) resets.
 </details>
 
 <details>
