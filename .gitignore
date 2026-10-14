@@ -1,0 +1,18 @@
+# 构建产物
+/dist/
+/bin/
+/web/dist/*
+!/web/dist/.gitkeep
+/web/node_modules/
+*.exe
+
+# 本地含密码/私有数据，绝不提交
+/legacy/
+*.csv
+proxies*.txt
+*.local.json
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: 构建前端
+        run: cd web && npm ci && npm run build
+      - name: go vet / test
+        run: |
+          go vet ./...
+          go test -race ./...
+      - name: shellcheck
+        run: |
+          sudo apt-get install -y -qq shellcheck
+          d=$(mktemp -d)
+          for f in install uninstall ctl; do { echo '#!/bin/sh'; cat scripts/common.sh scripts/$f.sh; } > $d/$f.sh; done
+          cp scripts/detect.sh scripts/probe.sh $d/
+          shellcheck -s sh -S warning -e SC2086,SC1091 $d/*.sh
+
+  e2e:
+    # 在真实 Linux（systemd）上通过 SSH 完整跑一遍：探测 → 部署 → 测试 → 重新部署 → 卸载
+    runs-on: ubuntu-24.04
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        login: [root-password, sudo-key]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 构建
+        run: |
+          cd web && npm ci && npm run build && cd ..
+          go build -o aio ./cmd/aio-proxy-tools
+      - name: 准备 SSH 与测试 IP
+        run: sh test/e2e/prepare.sh ${{ matrix.login }}
+      - name: 端到端测试
+        run: bash test/e2e/run.sh ${{ matrix.login }}
+      - name: 失败时收集日志
+        if: failure()
+        run: |
+          sudo journalctl -u aio-proxy -u aio-proxy-dns --no-pager -n 200 || true
+          sudo ls -la /etc/aio-proxy /opt/aio-proxy || true
+          sudo cat /etc/aio-proxy/3proxy.cfg || true
