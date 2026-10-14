@@ -100,7 +100,7 @@ RUN chmod 0755 /etc/init.d/e2e-ips \\
     else systemctl enable e2e-ips; rm -f /etc/init.d/e2e-ips; fi
 RUN ssh-keygen -A \\
  && mkdir -p /root/.ssh && chmod 700 /root/.ssh \\
- && echo 'root:' | chpasswd \\
+ && echo 'root:$SUDO_PW' | chpasswd \\
  && printf 'PermitRootLogin prohibit-password\nPasswordAuthentication yes\nKbdInteractiveAuthentication yes\n' > /tmp/sshd_extra \\
  && if [ -d /etc/ssh/sshd_config.d ]; then cp /tmp/sshd_extra /etc/ssh/sshd_config.d/00-e2e.conf; else cat /tmp/sshd_extra >> /etc/ssh/sshd_config; fi \\
  && useradd -m -s /bin/sh aio 2>/dev/null || adduser -D -s /bin/sh aio \\
