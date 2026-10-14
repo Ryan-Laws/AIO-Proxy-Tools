@@ -31,6 +31,7 @@ dump() {
   inct 'journalctl -u aio-proxy -u aio-proxy-dns --no-pager -n 80 2>/dev/null || cat /var/log/messages 2>/dev/null | tail -n 80' || true
   inct 'ls -la /etc/aio-proxy /opt/aio-proxy /opt/aio-proxy/bin 2>&1; cat /etc/aio-proxy/3proxy.cfg 2>&1 | head -n 60' || true
   inct 'ss -ltnup 2>/dev/null || netstat -ltnup 2>/dev/null' || true
+  inct 'ip -br addr; sysctl net.ipv4.ip_nonlocal_bind' || true
 }
 cleanup() {
   local rc=$?
@@ -124,6 +125,8 @@ start_ct() {
 add_ips() { for ip in "${IPS[@]}"; do inct "ip addr add $ip/16 dev eth0 2>/dev/null || true"; done; }
 wait_ssh() {
   for _ in $(seq 60); do
+    # 容器里开机流程常停在 degraded，/run/nologin 不会被删除，PAM 会拒绝所有登录（真实服务器没有这个问题）
+    docker exec "$name" rm -f /run/nologin /etc/nologin 2>/dev/null || true
     if ssh -i "$work/key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
          -o ConnectTimeout=2 root@"$CIP" true 2>/dev/null; then return 0; fi
     sleep 1
@@ -231,11 +234,17 @@ diff <(jq -S '[.manifest.proxies[] | {listen, protocol, port, user, pass}]' "$wo
      <(jq -S '[.manifest.proxies[] | {listen, protocol, port, user, pass}]' "$work/d2.json") || fail "重新部署后账号或端口变了"
 ok "账号和端口保持不变"
 
-say "6. 重启机器：服务应开机自启并在 IP 就绪后恢复"
+say "6. 重启机器：服务开机自启；额外 IP 晚于 3proxy 就绪（cloud-init/DHCP）也要能用"
 docker restart -t 10 $name >/dev/null
 wait_ssh
-for _ in $(seq 30); do [ "$(listening 21080)" -ge 3 ] && [ "$(listening 21081)" -ge 3 ] && break; sleep 1; done
-[ "$(listening 21080)" -ge 3 ] || fail "重启后 3proxy 没有恢复监听"
+# 先去掉额外 IP（不管测试镜像的开机服务有没有加上），模拟"3proxy 已启动、IP 还没到"
+for ip in "${IPS[@]}"; do inct "ip addr del $ip/16 dev eth0 2>/dev/null || true"; done
+for _ in $(seq 30); do inct "pgrep -f '^/opt/aio-proxy/bin/3proxy '" >/dev/null 2>&1 && break; sleep 1; done
+inct "pgrep -f '^/opt/aio-proxy/bin/3proxy '" >/dev/null 2>&1 || fail "重启后 3proxy 没有自动启动"
+sleep 2
+add_ips   # IP 此时才到
+for _ in $(seq 15); do [ "$(listening 21080)" -ge 3 ] && [ "$(listening 21081)" -ge 3 ] && break; sleep 1; done
+[ "$(listening 21080)" -ge 3 ] || fail "重启后 3proxy 没有在全部地址上监听"
 while read -r proto ip port user pass; do
   curl -fsS -m 15 -x "$(px "$proto" "$ip" "$port" "$user" "$pass")" "http://$ECHO:8000/ip" >/dev/null || fail "重启后 $proto $ip:$port 不可用"
 done < <(proxies "$work/d1.json")
@@ -279,28 +288,36 @@ while read -r _ ip port _ _; do
   ok "socks $ip:$port 白名单内可用，白名单外被拒"
 done < <(proxies "$work/d4.json")
 
-say "10. 流量额度（每账号 20MB）"
-run_aio deploy -ips "${IPS[0]}" -protocol http -http-port 23000 -auth per -quota 0.02 \
+say "10. 流量额度（每账号约 20MB，SOCKS5 与 HTTP 共用同一账号）"
+# 3proxy 按"剩余额度"处理每个连接：HTTP 代理会直接拒绝声明大小超过剩余额度的响应，SOCKS5 传到额度为止截断。
+# 所以检验的是：反复下载累计送达的数据不超过额度，并且最终会被拒绝。
+run_aio deploy -ips "${IPS[0]}" -protocol dual -socks-port 23000 -http-port 23001 -auth per -quota 0.02 \
   -via-listen -json "$work/d5.json" || fail "部署失败"
-read -r proto ip port user pass < <(proxies "$work/d5.json" | head -n1)
-p=$(px "$proto" "$ip" "$port" "$user" "$pass")
-got=$(curl -sS -m 60 -o /dev/null -w '%{size_download}' -x "$p" "http://$ECHO:8000/bytes?n=30000000" || true)
-echo "  第一次下载收到 $got 字节（额度 20MB，超出后应被截断或之后被拒绝）"
-sleep 2
-counters() {
-  inct 'p=$(sed -n "s/.*\"adminPort\": *\([0-9]*\).*/\1/p" /etc/aio-proxy/proxies.json); u=$(sed -n "s/.*\"adminUser\": *\"\([^\"]*\)\".*/\1/p" /etc/aio-proxy/proxies.json); w=$(sed -n "s/.*\"adminPass\": *\"\([^\"]*\)\".*/\1/p" /etc/aio-proxy/proxies.json); echo "user = \"$u:$w\"" | curl -s -K - "http://127.0.0.1:$p/C" | sed "s/<[^>]*>/ /g" | tr -s " " | grep -i count'
-}
-if curl -fsS -m 10 -x "$p" "http://$ECHO:8000/ip" >/dev/null 2>&1; then
-  echo "  计数器："; counters || true
-  fail "额度用完后仍能使用"
-fi
-ok "额度用完后被拒绝"
+limit=$(( 21 * 1048576 ))   # 0.02GB 向上取整为 21MB
+total=0; refused=0
+mapfile -t qps < <(proxies "$work/d5.json")
+for i in 1 2 3 4 5 6; do
+  read -r proto ip port user pass <<<"${qps[$(( i % ${#qps[@]} ))]}"
+  got=$(curl -s -m 60 -o /dev/null -w '%{size_download} %{http_code}' -x "$(px "$proto" "$ip" "$port" "$user" "$pass")" \
+    "http://$ECHO:8000/bytes?n=8000000" 2>/dev/null || true)
+  read -r bytes code <<<"$got"
+  bytes=${bytes:-0}
+  echo "  第 $i 次（$proto）：收到 $bytes 字节，HTTP $code"
+  [ "$code" = 200 ] && [ "$bytes" -ge 8000000 ] || refused=$((refused + 1))
+  [ "$code" = 200 ] && total=$(( total + bytes ))
+  sleep 1
+done
+echo "  累计送达 $total 字节，额度 $limit 字节"
+[ "$total" -le $(( limit + 1048576 )) ] || fail "累计送达 $total 字节，超过了额度"
+[ "$total" -ge $(( 8000000 * 2 )) ] || fail "额度内的下载也被拒绝了（累计只有 $total 字节）"
+[ "$refused" -ge 1 ] || fail "超出额度后没有被拒绝"
+ok "额度内正常使用，超出后被拒绝/截断，累计未超额"
 
 say "11. 卸载"
 run_aio uninstall || fail "卸载失败"
 inct "test ! -e /etc/aio-proxy && test ! -e /opt/aio-proxy" || fail "卸载后还留有文件"
 inct "pgrep -f /opt/aio-proxy/bin/3proxy" >/dev/null 2>&1 && fail "卸载后 3proxy 仍在运行"
-inct "ss -ltnH | grep -E ':(21080|21081|22000|23000) '" >/dev/null 2>&1 && fail "卸载后端口仍在监听"
+inct "ss -ltnH | grep -E ':(21080|21081|22000|23000|23001) '" >/dev/null 2>&1 && fail "卸载后端口仍在监听"
 inct "ss -lnuH | grep ':5335 '" >/dev/null 2>&1 && fail "卸载后 DNS 解析器仍在运行"
 inct "ls /etc/systemd/system/aio-proxy* /etc/init.d/aio-proxy* /etc/sysctl.d/99-aio-proxy.conf /etc/periodic/hourly/aio-proxy* 2>/dev/null" && fail "卸载后还留有服务或系统配置文件"
 case $fw in
