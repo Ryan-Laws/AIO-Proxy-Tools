@@ -241,6 +241,12 @@ ok "账号和端口保持不变"
 say "6. 重启机器：服务开机自启；额外 IP 晚于 3proxy 就绪（cloud-init/DHCP）也要能用"
 docker restart -t 10 $name >/dev/null
 wait_ssh
+# 部分镜像（EL8）在容器里重启后根文件系统是只读的（真实服务器不会）：记录下来并恢复可写，
+# 3proxy 服务应靠 Restart=always 自己恢复
+if ! inct "touch /etc/.e2e-rw && rm -f /etc/.e2e-rw" 2>/dev/null; then
+  echo "  测试容器重启后根文件系统为只读：$(inct "grep ' / ' /proc/mounts" 2>&1)"
+  inct "mount -o remount,rw /" || fail "无法恢复测试容器的根文件系统"
+fi
 # 先去掉额外 IP（不管测试镜像的开机服务有没有加上），模拟"3proxy 已启动、IP 还没到"
 for ip in "${IPS[@]}"; do inct "ip addr del $ip/16 dev eth0 2>/dev/null || true"; done
 for _ in $(seq 60); do inct "pgrep -f '^/opt/aio-proxy/bin/3proxy '" >/dev/null 2>&1 && break; sleep 1; done
