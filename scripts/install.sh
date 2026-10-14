@@ -20,11 +20,17 @@ need=""
 # curl 是必需的：服务器自检、递归 DNS 失败检测都依赖它（busybox wget 不支持代理和绑定地址）
 has curl || need="$need curl"
 has tar || need="$need tar"
+has gzip || need="$need gzip"   # 解压源码包需要（openSUSE 等最小化镜像没有）
 case "$PM" in dnf|yum) iproute=iproute ;; *) iproute=iproute2 ;; esac
 has ip || need="$need $iproute"
 has ss || has netstat || need="$need $iproute"
 has pgrep || case "$PM" in apk) ;; apt-get) need="$need procps" ;; zypper) need="$need procps" ;; *) need="$need procps-ng" ;; esac
-[ -d /etc/ssl/certs ] || need="$need ca-certificates"
+# 看实际的 CA 证书包而不是目录：openssl 包会创建空的 /etc/ssl/certs
+ca_ok=0
+for b in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
+  [ -s "$b" ] && ca_ok=1
+done
+[ $ca_ok = 1 ] || need="$need ca-certificates"
 if [ -n "$need" ]; then
   info "安装:$need"
   pkg_install $need || warn "部分依赖安装失败:$need"
@@ -50,12 +56,23 @@ verify() {
   [ "$want" = "$got" ] || { warn "$2 SHA256 不匹配"; return 1; }
 }
 
+# binary_ok 文件 [verbose]：检查是否是能在本机运行的 3proxy 程序；verbose 时说明不能用的原因
 binary_ok() {
-  [ -x "$1" ] || return 1
+  [ -x "$1" ] || { [ -n "$2" ] && info "$(basename "$1") 不可执行"; return 1; }
   # 必须是 ELF 程序：官方 deb 里还有同名的 /etc/init.d/3proxy 启动脚本
   [ "$(dd if="$1" bs=1 skip=1 count=3 2>/dev/null)" = ELF ] || return 1
-  if has ldd && ldd "$1" 2>&1 | grep -q "not found"; then return 1; fi
+  if has ldd; then
+    missing=$(ldd "$1" 2>&1 | awk '/not found/{print $1}' | tr '\n' ' ')
+    if [ -n "$missing" ]; then [ -n "$2" ] && info "缺少运行库: $missing"; return 1; fi
+  fi
   return 0
+}
+
+# 把候选程序装到最终位置再检查：/tmp 常挂载为 noexec，在那里检查会误判
+try_install_bin() {
+  install -m 0755 "$1" "$BIN.new" || return 1
+  if binary_ok "$BIN.new" verbose; then mv -f "$BIN.new" "$BIN"; return 0; fi
+  rm -f "$BIN.new"; return 1
 }
 
 install_from_pkg() {
@@ -86,9 +103,24 @@ install_from_pkg() {
     *.deb) dpkg-deb -x "$T/$pkg" "$T/x" 2>/dev/null || { warn "dpkg-deb 无法解包（系统 dpkg 不支持 zstd）"; return 1; } ;;
     *.rpm) has cpio || pkg_install cpio; (cd "$T/x" && rpm2cpio "$T/$pkg" | cpio -idm --quiet 2>/dev/null) || return 1 ;;
   esac
-  f=$(find "$T/x" -type f -name 3proxy | while read -r c; do binary_ok "$c" && { echo "$c"; break; }; done)
-  [ -n "$f" ] || { warn "安装包中的程序无法在本系统运行"; return 1; }
-  install -m 0755 "$f" "$BIN.new" && mv -f "$BIN.new" "$BIN"
+  # 安装包里可能有同名的启动脚本：只取 ELF 程序
+  f=$(find "$T/x" -type f -name 3proxy | while read -r c; do
+    [ "$(dd if="$c" bs=1 skip=1 count=3 2>/dev/null)" = ELF ] && { echo "$c"; break; }
+  done)
+  [ -n "$f" ] || { warn "安装包中没有找到 3proxy 程序"; return 1; }
+  try_install_bin "$f" && return 0
+  # 缺运行库：按安装包声明的依赖补装后再试（只装依赖，不执行安装包自带的脚本）
+  case "$pkg" in
+    *.deb) deps=$(dpkg-deb -f "$T/$pkg" Depends 2>/dev/null | sed 's/([^)]*)//g; s/|[^,]*//g; s/,/ /g') ;;
+    *.rpm) deps=$(rpm -qpR "$T/$pkg" 2>/dev/null | grep -v '^rpmlib\|^/' | awk '{print $1}' | tr '\n' ' ') ;;
+  esac
+  if [ -n "$deps" ]; then
+    info "安装运行依赖: $deps"
+    pkg_install $deps
+    try_install_bin "$f" && return 0
+  fi
+  warn "官方安装包中的程序无法在本系统运行"
+  return 1
 }
 
 install_from_src() {
@@ -108,7 +140,7 @@ install_from_src() {
     esac
     has gcc && has make || die "无法安装 gcc/make，无法编译 3proxy"
   fi
-  tar xzf "$T/$src" -C "$T" || return 1
+  tar xzf "$T/$src" -C "$T" || { warn "解压源码失败"; return 1; }
   d="$T/3proxy-$TP_VERSION"
   jobs=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
   if ! (cd "$d" && make -f Makefile.Linux -j"$jobs" >"$T/build.log" 2>&1); then
@@ -117,8 +149,8 @@ install_from_src() {
     (cd "$d" && make -f Makefile.Linux clean >/dev/null 2>&1; CFLAGS=-O2 LDFLAGS=-O2 make -f Makefile.Linux -j"$jobs" >"$T/build.log" 2>&1) \
       || { tail -n 20 "$T/build.log"; return 1; }
   fi
-  binary_ok "$d/bin/3proxy" || return 1
-  install -m 0755 "$d/bin/3proxy" "$BIN.new" && mv -f "$BIN.new" "$BIN"
+  [ -f "$d/bin/3proxy" ] || { tail -n 20 "$T/build.log"; warn "编译没有生成 3proxy 程序"; return 1; }
+  try_install_bin "$d/bin/3proxy" || { warn "编译出的程序无法运行"; return 1; }
 }
 
 step "安装 3proxy $TP_VERSION"

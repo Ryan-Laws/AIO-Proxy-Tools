@@ -93,11 +93,17 @@ s=$(srv)
 [ "$(jq '[.tests[] | select(.where=="server" and .ok)] | length' <<<"$s")" = 6 ] || fail "服务器自检未全部通过: $(jq -c '.tests' <<<"$s")"
 echo "✓ 自检 6/6"
 
-say "刷新：服务状态与流量统计"
+say "刷新：服务状态与流量统计（先经第一个代理下载约 3MB）"
+read -r tproto tip tport tuser tpass < <(jq -r '.manifest.proxies[0] | "\(.protocol) \(.listen) \(.port) \(.user) \(.pass)"' <<<"$s")
+tscheme=socks5h; [ "$tproto" = http ] && tscheme=http
+curl -fsS -m 60 -o /dev/null -x "$tscheme://$tuser:$tpass@$tip:$tport" "https://speed.cloudflare.com/__down?bytes=3000000" \
+  || fail "经代理下载测试文件失败"
+sleep 3
 wait_task "$(api POST "/api/servers/$SID/refresh" '{}' | jq -r .taskId)"
 s=$(srv)
 jq -e '.status.active and .status.dnsActive and .status.pid > 0' <<<"$s" >/dev/null || fail "服务状态不对: $(jq -c .status <<<"$s")"
-jq -e '[.stats[].usedMB] | add > 0' <<<"$s" >/dev/null || fail "流量统计没有数据: $(jq -c .stats <<<"$s")"
+used=$(jq --arg u "$tuser" '[.stats[] | select(.user == $u) | .usedMB] | add // 0' <<<"$s")
+awk -v u="$used" 'BEGIN{exit !(u >= 2)}' || fail "账号 $tuser 下载约 3MB 后流量统计为 ${used}MB: $(jq -c .stats <<<"$s")"
 echo "✓ 运行中，流量统计 $(jq -c '[.stats[] | {user, usedMB}]' <<<"$s")"
 
 say "服务控制：停止 → 启动"
@@ -107,6 +113,12 @@ wait_task "$(api POST "/api/servers/$SID/service" '{"action":"start"}' | jq -r .
 for _ in $(seq 15); do ss -ltnH | grep -q ':24081 ' && break; sleep 1; done
 ss -ltnH | grep -q ':24081 ' || fail "启动后端口没有监听"
 echo "✓ 停止与启动正常"
+
+say "开启 SOCKS5 UDP（实验功能）重新部署：配置必须能被 3proxy 接受"
+udp_settings=$(jq '.udp = true | .keepExisting = true' <<<"$settings")
+wait_task "$(api POST "/api/servers/$SID/deploy" "$(jq -n --argjson s "$udp_settings" --argjson sel "$IPS" '{settings:$s, selected:$sel}')" | jq -r .taskId)"
+ss -ltnH | grep -q ':24080 ' || fail "开启 UDP 后 SOCKS5 端口没有监听"
+echo "✓ UDP 开启后服务正常"
 
 say "SSE 事件流"
 events=$(timeout 5 curl -sS -N "$B/api/events?t=$TOK" || true)

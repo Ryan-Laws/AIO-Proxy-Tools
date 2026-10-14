@@ -20,8 +20,9 @@ fi
 probe() {
   a=$1; r=""
   case "$a" in
-    *:*) fam=-6; urls="https://api64.ipify.org https://ipv6.icanhazip.com https://ifconfig.co/ip" ;;
-    *)   fam=-4; urls="https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip" ;;
+    # 末尾的 http 地址兜底：有些机器的 curl 没有 CA 证书，https 全部失败（回显的只是本机出口 IP，不敏感）
+    *:*) fam=-6; urls="https://api64.ipify.org https://ipv6.icanhazip.com https://ifconfig.co/ip http://api64.ipify.org http://ipv6.icanhazip.com" ;;
+    *)   fam=-4; urls="https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip http://api.ipify.org http://ipv4.icanhazip.com" ;;
   esac
   for u in $urls; do
     if command -v curl >/dev/null 2>&1; then

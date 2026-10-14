@@ -125,7 +125,7 @@ jobs:
       matrix:
         include:
           - { image: "debian:12", login: root-key, fw: ufw }
-          - { image: "debian:11", login: sudo-pass, fw: none }
+          - { image: "debian:13", login: sudo-pass, fw: none }
           - { image: "ubuntu:22.04", login: root-key, fw: none }
           - { image: "rockylinux/rockylinux:9", login: sudo-pass, fw: firewalld }
           - { image: "almalinux:8", login: root-key, fw: none }

@@ -50,6 +50,7 @@ type Store struct {
 
 	vaultKey  []byte
 	vaultSalt []byte
+	vaultN    int // 派生密钥用的 scrypt N，保存时沿用
 	vault     map[string]Secret
 }
 
@@ -152,7 +153,15 @@ func (s *Store) VaultUnlocked() bool {
 	return s.vaultKey != nil
 }
 
+// newVaultN 是新建保险箱的 scrypt 参数（约 128MB 内存、数百毫秒），提高离线爆破成本；
+// 旧保险箱按文件里记录的参数解锁，并沿用该参数保存
+const newVaultN = 1 << 17
+
 func deriveKey(pw string, salt []byte, n, r, p int) ([]byte, error) {
+	// 参数来自文件，限制范围，防止被篡改成极大值耗尽内存
+	if n < 1<<14 || n > 1<<20 || n&(n-1) != 0 || r != 8 || p != 1 {
+		return nil, errors.New("保险箱参数无效")
+	}
 	return scrypt.Key([]byte(pw), salt, n, r, p, 32)
 }
 
@@ -165,12 +174,12 @@ func (s *Store) CreateVault(password string) error {
 	}
 	salt := make([]byte, 16)
 	rand.Read(salt)
-	key, err := deriveKey(password, salt, 1<<15, 8, 1)
+	key, err := deriveKey(password, salt, newVaultN, 8, 1)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
-	s.vaultKey, s.vaultSalt, s.vault = key, salt, map[string]Secret{}
+	s.vaultKey, s.vaultSalt, s.vaultN, s.vault = key, salt, newVaultN, map[string]Secret{}
 	s.mu.Unlock()
 	return s.flushVault()
 }
@@ -201,7 +210,7 @@ func (s *Store) UnlockVault(password string) (map[string]Secret, error) {
 		return nil, err
 	}
 	s.mu.Lock()
-	s.vaultKey, s.vaultSalt, s.vault = key, vf.Salt, m
+	s.vaultKey, s.vaultSalt, s.vaultN, s.vault = key, vf.Salt, vf.N, m
 	s.mu.Unlock()
 	out := map[string]Secret{}
 	for k, v := range m {
@@ -258,6 +267,6 @@ func (s *Store) flushVault() error {
 	}
 	nonce := make([]byte, gcm.NonceSize())
 	rand.Read(nonce)
-	vf := vaultFile{V: 1, Salt: s.vaultSalt, N: 1 << 15, R: 8, P: 1, Nonce: nonce, Data: gcm.Seal(nil, nonce, plain, nil)}
+	vf := vaultFile{V: 1, Salt: s.vaultSalt, N: s.vaultN, R: 8, P: 1, Nonce: nonce, Data: gcm.Seal(nil, nonce, plain, nil)}
 	return writeJSON(s.Path("vault.json"), vf, 0o600)
 }

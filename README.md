@@ -125,7 +125,7 @@ You can filter by subnet, show only IPv4 or IPv6, or show only working IPs. Shif
 |---|---|
 | Protocol | SOCKS5 only · HTTP only · Both on separate ports (recommended) · Both on one port |
 | Ports | Set per protocol: one **shared** port for every IP / **incrementing** per IP / **random**. Any row can also be edited individually in the preview |
-| Accounts | Random per IP · One shared random account · Custom · Import a list · No auth (with a source-IP allowlist) |
+| Accounts | Random per IP · One shared random account · Custom · Import a list · No auth (a source-IP allowlist is required) |
 | Limits | Per-account bandwidth (Mbps), max concurrent connections, daily / weekly / monthly traffic quota, expiry date |
 | DNS | Local recursive (default) · Local cache + forwarding · Public DNS · System resolver · Custom |
 | System options | Open firewall ports · Enable BBR · Kernel tuning · Block private networks · Keep existing ports and accounts on redeploy · Stop conflicting proxy services · SOCKS5 UDP (experimental) · Connection logging (off by default) · GitHub mirror |
@@ -188,6 +188,7 @@ Common flags:
 | `-socks-port` / `-http-port` | Ports in shared-port mode | `1080` / `8080` |
 | `-port-mode` | `same` · `inc` · `random` | `same` |
 | `-auth` | `per` (per IP) · `shared` · `custom` · `none` | `per` |
+| `-whitelist` | Source-IP allowlist (comma-separated IPs or CIDRs), required with `-auth none` | empty |
 | `-ips` | Only use these IPs (comma-separated). Empty means every IPv4 with a working exit | empty |
 | `-speed` / `-max-conn` / `-quota` | Per-account bandwidth (Mbps) / max connections / monthly traffic (GB). `0` means unlimited | `0` |
 | `-dns` | `recursive` · `forward` · `public` · `system` | `recursive` |
@@ -250,9 +251,9 @@ Yes. The app tries three approaches in order:
 
 1. The official 3proxy deb / rpm package.
 2. If the distribution has no official package, the official source code, built on the server.
-3. If the server can't reach GitHub, your computer downloads the files (using your `HTTPS_PROXY` environment variable) and uploads them. You can also set a GitHub mirror in the settings.
+3. If the server can't reach GitHub, your computer downloads the files (using your `HTTPS_PROXY` environment variable) and uploads them. You can also set a GitHub mirror (https only) in the settings.
 
-Whichever way the files arrive, they're checked against the official `SHA256SUMS`.
+Whichever way the files arrive, they must match the **official SHA256 hashes built into the app**. The hashes don't come from a downloaded checksum file, so a mirror or man-in-the-middle can't swap the package.
 </details>
 
 <details>
@@ -270,7 +271,7 @@ By default, nowhere. SSH passwords stay in memory and are gone when you close th
   - Linux: `~/.config/aio-proxy-tools`
 - **On the server**:
   - 3proxy runs as a dedicated non-root user;
-  - access to the server itself and to private networks through the proxy is blocked by default;
+  - the server's own addresses, loopback and cloud metadata services are always blocked through the proxy, and private networks are blocked by default;
   - the HTTP proxy adds no `X-Forwarded-For` or similar headers that would reveal the client IP;
   - connection logging is off by default.
 - **No telemetry**: the app doesn't collect or upload usage data, and doesn't phone home to check for updates.

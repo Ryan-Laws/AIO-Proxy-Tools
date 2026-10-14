@@ -97,7 +97,8 @@ COPY e2e-ips.openrc /etc/init.d/e2e-ips
 RUN chmod 0755 /etc/init.d/e2e-ips \\
  && if command -v rc-update >/dev/null; then rc-update add e2e-ips boot; rm -f /etc/systemd/system/e2e-ips.service; \\
     else systemctl enable e2e-ips; rm -f /etc/init.d/e2e-ips; fi
-RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh \\
+RUN ssh-keygen -A \\
+ && mkdir -p /root/.ssh && chmod 700 /root/.ssh \\
  && sed -i 's/^root:[!*]*:/root:*:/' /etc/shadow \\
  && printf 'PermitRootLogin prohibit-password\nPasswordAuthentication yes\nKbdInteractiveAuthentication yes\n' > /tmp/sshd_extra \\
  && if [ -d /etc/ssh/sshd_config.d ]; then cp /tmp/sshd_extra /etc/ssh/sshd_config.d/00-e2e.conf; else cat /tmp/sshd_extra >> /etc/ssh/sshd_config; fi \\
@@ -199,7 +200,8 @@ say "3. 账号隔离、服务状态、安全设置"
 read -r _ _ _ ua pa < <(jq -r '.manifest.proxies[] | select(.listen=="172.17.200.1" and .protocol=="socks") | "x x x \(.user) \(.pass)"' "$work/d1.json")
 if curl -fsS -m 8 -x "socks5h://$ua:$pa@172.17.200.2:21080" "http://$ECHO:8000/ip" >/dev/null 2>&1; then fail "IP1 的账号能用在 IP2 上"; fi
 ok "账号互相隔离"
-u=$(inct "ps -o user= -p \$(pgrep -f /opt/aio-proxy/bin/3proxy | head -n1) 2>/dev/null || ps -o user,args | awk '/opt\\/aio-proxy\\/bin\\/3proxy/ && !/awk/{print \$1; exit}'" | tr -d ' ')
+# 只匹配以程序路径开头的进程（OpenRC 的 supervise-daemon 参数里也含这个路径，但它是 root）
+u=$(inct "stat -c %U /proc/\$(pgrep -o -f '^/opt/aio-proxy/bin/3proxy ')" | tr -d ' ')
 [ "$u" = aio-proxy ] || fail "3proxy 运行用户是 '$u'，应为 aio-proxy"
 ok "3proxy 以非 root 用户 aio-proxy 运行"
 dnsl=$(inct "ss -lnuH 2>/dev/null | awk '{print \$4}' | grep ':5335\$' || true")
