@@ -418,17 +418,20 @@ Persistent=true
 WantedBy=timers.target
 EOF
 else
-  # 其它 init（OpenRC 等）：写入 root 的 crontab，并确保 crond 在运行（不少镜像默认没启用）
-  if has crontab; then
-    (crontab -l 2>/dev/null | grep -v '/opt/aio-proxy/expire.sh'; echo "* * * * * $OPT/expire.sh --reload") | crontab - 2>/dev/null
-  fi
-  if [ $INIT = openrc ]; then
-    for c in crond cronie dcron; do
-      [ -x /etc/init.d/$c ] || continue
-      svc_enabled $c || { rc-update add $c default >/dev/null 2>&1 && echo $c >> "$ETC/enabled-services"; }
-      svc_active $c || rc-service $c start >/dev/null 2>&1
-      break
-    done
+  # OpenRC：用一个受监督的小服务每分钟执行一次（不依赖 cron，最小化 Alpine 常常没有启用 crond）
+  printf '#!/bin/sh\nwhile :; do sleep 60; %s --reload; done\n' "$OPT/expire.sh" > "$OPT/guard.sh"
+  chmod 0755 "$OPT/guard.sh"
+  cat > /etc/init.d/$SVC-guard <<EOF
+#!/sbin/openrc-run
+description="AIO Proxy Tools expiry and quota check (every minute)"
+command="$OPT/guard.sh"
+supervisor=supervise-daemon
+depend() { after $SVC; }
+EOF
+  chmod 0755 /etc/init.d/$SVC-guard
+  # 旧版本写入的 crontab 条目
+  if has crontab && crontab -l 2>/dev/null | grep -q '/opt/aio-proxy/expire.sh'; then
+    crontab -l 2>/dev/null | grep -v '/opt/aio-proxy/expire.sh' | crontab - 2>/dev/null
   fi
 fi
 
@@ -482,9 +485,9 @@ Group=$RUN_GROUP
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-# 沙箱：看不到 /home。不用 ProtectSystem / PrivateTmp：EL8（systemd 239）上以 + 开头的
-# ExecStartPre 也会受其限制，写不了 /etc/aio-proxy，服务无法启动（Read-only file system）
-ProtectHome=yes
+# 不用 ProtectSystem / ProtectHome / PrivateTmp 等挂载命名空间类沙箱：EL8（systemd 239）上
+# 以 + 开头的 ExecStartPre 也会受其影响，写不了 /etc/aio-proxy，服务无法启动（Read-only file system）。
+# 安全性由非 root 用户 + NoNewPrivileges + 只保留绑定低端口的能力保证
 ExecStartPre=+$OPT/bind-ip.sh
 ExecStartPre=+$OPT/expire.sh
 ExecStartPre=-+$OPT/fw-apply.sh
@@ -519,7 +522,8 @@ depend() { need net; after $DNS_SVC; }
 start_pre() { $OPT/bind-ip.sh; $OPT/expire.sh; [ -x $OPT/fw-apply.sh ] && $OPT/fw-apply.sh; return 0; }
 reload() { ebegin "Reloading \$RC_SVCNAME"; pkill -USR1 -f "^$BIN " ; eend \$?; }
 EOF
-    chmod 0755 /etc/init.d/$SVC ;;
+    chmod 0755 /etc/init.d/$SVC
+    svc_enable "$SVC-guard"; svc_restart "$SVC-guard" 2>/dev/null || svc_start "$SVC-guard" ;;
   *) die "不支持的 init 系统（需要 systemd 或 OpenRC）" ;;
 esac
 svc_enable "$SVC"
