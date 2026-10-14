@@ -281,8 +281,8 @@ case "$DNS_MODE" in
             cat > /etc/systemd/system/$DNS_SVC.service <<EOF
 [Unit]
 Description=AIO Proxy Tools DNS resolver (unbound)
-After=network-online.target
-Wants=network-online.target
+# 不等 network-online：本机解析器只监听 127.0.0.1；等待联网在部分系统上会把开机启动拖延约 2 分钟
+After=network.target
 Before=$SVC.service
 
 [Service]
@@ -427,8 +427,8 @@ case $INIT in
     cat > /etc/systemd/system/$SVC.service <<EOF
 [Unit]
 Description=AIO Proxy Tools (3proxy)
-After=network-online.target $DNS_SVC.service
-Wants=network-online.target
+# 不等 network-online：已开启 ip_nonlocal_bind，地址晚到也能监听；等待联网在部分系统上会拖延约 2 分钟
+After=network.target $DNS_SVC.service
 
 [Service]
 Type=simple

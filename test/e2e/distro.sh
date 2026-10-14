@@ -100,7 +100,7 @@ RUN chmod 0755 /etc/init.d/e2e-ips \\
     else systemctl enable e2e-ips; rm -f /etc/init.d/e2e-ips; fi
 RUN ssh-keygen -A \\
  && mkdir -p /root/.ssh && chmod 700 /root/.ssh \\
- && sed -i 's/^root:[^:]*:/root:*:/' /etc/shadow \\
+ && echo 'root:' | chpasswd \\
  && printf 'PermitRootLogin prohibit-password\nPasswordAuthentication yes\nKbdInteractiveAuthentication yes\n' > /tmp/sshd_extra \\
  && if [ -d /etc/ssh/sshd_config.d ]; then cp /tmp/sshd_extra /etc/ssh/sshd_config.d/00-e2e.conf; else cat /tmp/sshd_extra >> /etc/ssh/sshd_config; fi \\
  && useradd -m -s /bin/sh aio 2>/dev/null || adduser -D -s /bin/sh aio \\
@@ -239,8 +239,11 @@ docker restart -t 10 $name >/dev/null
 wait_ssh
 # 先去掉额外 IP（不管测试镜像的开机服务有没有加上），模拟"3proxy 已启动、IP 还没到"
 for ip in "${IPS[@]}"; do inct "ip addr del $ip/16 dev eth0 2>/dev/null || true"; done
-for _ in $(seq 30); do inct "pgrep -f '^/opt/aio-proxy/bin/3proxy '" >/dev/null 2>&1 && break; sleep 1; done
-inct "pgrep -f '^/opt/aio-proxy/bin/3proxy '" >/dev/null 2>&1 || fail "重启后 3proxy 没有自动启动"
+for _ in $(seq 60); do inct "pgrep -f '^/opt/aio-proxy/bin/3proxy '" >/dev/null 2>&1 && break; sleep 1; done
+if ! inct "pgrep -f '^/opt/aio-proxy/bin/3proxy '" >/dev/null 2>&1; then
+  inct "systemctl is-system-running; systemctl list-jobs --no-pager; systemctl status aio-proxy aio-proxy-dns --no-pager -n 20; journalctl -b --no-pager -n 40 2>/dev/null; rc-status 2>/dev/null" || true
+  fail "重启后 3proxy 没有自动启动"
+fi
 sleep 2
 add_ips   # IP 此时才到
 for _ in $(seq 15); do [ "$(listening 21080)" -ge 3 ] && [ "$(listening 21081)" -ge 3 ] && break; sleep 1; done
@@ -302,7 +305,7 @@ for i in 1 2 3 4 5 6; do
     "http://$ECHO:8000/bytes?n=8000000" 2>/dev/null || true)
   read -r bytes code <<<"$got"
   bytes=${bytes:-0}
-  echo "  第 $i 次（$proto）：收到 $bytes 字节，HTTP $code"
+  echo "  第 $i 次（$proto）：收到 $bytes 字节，HTTP $code，3proxy PID $(inct "pgrep -o -f '^/opt/aio-proxy/bin/3proxy '" 2>/dev/null)"
   [ "$code" = 200 ] && [ "$bytes" -ge 8000000 ] || refused=$((refused + 1))
   [ "$code" = 200 ] && total=$(( total + bytes ))
   sleep 1
@@ -316,7 +319,7 @@ ok "额度内正常使用，超出后被拒绝/截断，累计未超额"
 say "11. 卸载"
 run_aio uninstall || fail "卸载失败"
 inct "test ! -e /etc/aio-proxy && test ! -e /opt/aio-proxy" || fail "卸载后还留有文件"
-inct "pgrep -f /opt/aio-proxy/bin/3proxy" >/dev/null 2>&1 && fail "卸载后 3proxy 仍在运行"
+inct "pgrep -f '^/opt/aio-proxy/bin/3proxy '" >/dev/null 2>&1 && fail "卸载后 3proxy 仍在运行"
 inct "ss -ltnH | grep -E ':(21080|21081|22000|23000|23001) '" >/dev/null 2>&1 && fail "卸载后端口仍在监听"
 inct "ss -lnuH | grep ':5335 '" >/dev/null 2>&1 && fail "卸载后 DNS 解析器仍在运行"
 inct "ls /etc/systemd/system/aio-proxy* /etc/init.d/aio-proxy* /etc/sysctl.d/99-aio-proxy.conf /etc/periodic/hourly/aio-proxy* 2>/dev/null" && fail "卸载后还留有服务或系统配置文件"
