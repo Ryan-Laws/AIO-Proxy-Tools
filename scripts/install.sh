@@ -332,14 +332,35 @@ echo "${TOOL_VERSION:-unknown}" > "$ETC/version"
 # 到期账号过滤：生成 users.active（3proxy 实际读取的账号表）
 cat > "$OPT/expire.sh" <<'EOF'
 #!/bin/sh
-# 根据 /etc/aio-proxy/expiry.list 过滤到期账号，变化时让 3proxy 重新加载
+# 生成 3proxy 实际读取的账号表 users.active = users.list − 已到期账号 − 额度将尽的账号，
+# 变化时让 3proxy 重新加载（每分钟执行一次）。
+#
+# 额度守护：3proxy 按"剩余额度"限制每个连接，但在额度用尽的边界上，偶尔会有连接不受限制
+# （实测 3proxy 1.0.1）。所以剩余不足 1MB 的账号直接从账号表移除，新连接认证失败；
+# 计数周期（日/周/月）重置后剩余额度恢复，账号自动重新启用。
 E=/etc/aio-proxy
 umask 027   # 临时文件含明文密码：从创建起就不让其它用户读
 today=$(date +%Y-%m-%d)
 tmp=$E/users.active.tmp
+over=$E/over-quota.tmp
+: > "$over"
+# 读取流量计数器（3proxy 未运行时读不到，只按到期过滤）
+port=$(sed -n 's/.*"adminPort": *\([0-9]*\).*/\1/p' "$E/proxies.json" | head -n1)
+au=$(sed -n 's/.*"adminUser": *"\([^"]*\)".*/\1/p' "$E/proxies.json" | head -n1)
+ap=$(sed -n 's/.*"adminPass": *"\([^"]*\)".*/\1/p' "$E/proxies.json" | head -n1)
+if [ -n "$port" ] && command -v curl >/dev/null 2>&1; then
+  # 计数器表格每行：类型 | 编号/用户 | 启用 | 用户 | 源 | 目标 | 端口 | 额度MB | 周期 | 已用MB | ...
+  echo "user = \"$au:$ap\"" | curl -s -m 5 -K - "http://127.0.0.1:$port/C" 2>/dev/null | tr '\n' ' ' | sed 's/<tr>/\
+/g' | awk -F'</td><td>' '$1 ~ /count(all|in|out)/ {
+      n = split($2, a, "/"); u = a[n]; lim = $8; used = $10
+      gsub(/<[^>]*>/, "", lim); gsub(/<[^>]*>/, "", used)
+      if (lim + 0 > 0 && lim + 0 < 999999999 && used + 0 >= lim - 1) print u }' > "$over"
+fi
 # 用 FILENAME 而不是 NR==FNR 区分文件：expiry.list 为空时 NR==FNR 对 users.list 也成立，会吞掉全部账号
 awk -v t="$today" 'FILENAME == ARGV[1] { if ($2 != "" && $2 < t) x[$1]=1; next }
-                   { split($0,a,":"); if (!(a[1] in x)) print }' "$E/expiry.list" "$E/users.list" > "$tmp"
+                   FILENAME == ARGV[2] { x[$1]=1; next }
+                   { split($0,a,":"); if (!(a[1] in x)) print }' "$E/expiry.list" "$over" "$E/users.list" > "$tmp"
+rm -f "$over"
 if ! cmp -s "$tmp" "$E/users.active" 2>/dev/null; then
   mv -f "$tmp" "$E/users.active"
   chgrp "$(stat -c %G "$E/users.list")" "$E/users.active" 2>/dev/null; chmod 0640 "$E/users.active"
@@ -354,36 +375,38 @@ EOF
 chmod 0755 "$OPT/expire.sh"
 "$OPT/expire.sh"
 
-# 每小时检查到期
+# 每分钟检查到期和额度
+rm -f /etc/periodic/hourly/$SVC-expire   # 旧版本的每小时任务
 if [ $INIT = systemd ]; then
   cat > /etc/systemd/system/$SVC-expire.service <<EOF
 [Unit]
-Description=AIO Proxy Tools expiry check
+Description=AIO Proxy Tools expiry and quota check
 [Service]
 Type=oneshot
 ExecStart=$OPT/expire.sh --reload
 EOF
   cat > /etc/systemd/system/$SVC-expire.timer <<EOF
 [Unit]
-Description=AIO Proxy Tools hourly expiry check
+Description=AIO Proxy Tools expiry and quota check (every minute)
 [Timer]
-OnCalendar=hourly
+OnCalendar=minutely
+AccuracySec=5s
 Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-elif [ -d /etc/periodic/hourly ]; then
-  printf '#!/bin/sh\n%s --reload\n' "$OPT/expire.sh" > /etc/periodic/hourly/$SVC-expire
-  chmod 0755 /etc/periodic/hourly/$SVC-expire
-  # /etc/periodic 由 crond 执行：不少镜像默认没启用 crond
-  if [ $INIT = openrc ] && [ -x /etc/init.d/crond ]; then
-    svc_enabled crond || { rc-update add crond default >/dev/null 2>&1 && echo crond >> "$ETC/enabled-services"; }
-    svc_active crond || rc-service crond start >/dev/null 2>&1
-  fi
 else
-  # 没有定时机制：写入 root 的 crontab
+  # 其它 init（OpenRC 等）：写入 root 的 crontab，并确保 crond 在运行（不少镜像默认没启用）
   if has crontab; then
-    (crontab -l 2>/dev/null | grep -v '/opt/aio-proxy/expire.sh'; echo "17 * * * * $OPT/expire.sh --reload") | crontab - 2>/dev/null
+    (crontab -l 2>/dev/null | grep -v '/opt/aio-proxy/expire.sh'; echo "* * * * * $OPT/expire.sh --reload") | crontab - 2>/dev/null
+  fi
+  if [ $INIT = openrc ]; then
+    for c in crond cronie dcron; do
+      [ -x /etc/init.d/$c ] || continue
+      svc_enabled $c || { rc-update add $c default >/dev/null 2>&1 && echo $c >> "$ETC/enabled-services"; }
+      svc_active $c || rc-service $c start >/dev/null 2>&1
+      break
+    done
   fi
 fi
 
@@ -437,11 +460,10 @@ Group=$RUN_GROUP
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-# 沙箱：系统目录只读，只有数据目录可写（以 + 开头的 ExecStartPre 以 root 运行，不受限制）
-ProtectSystem=strict
-ReadWritePaths=$VAR
+# 沙箱：/usr、/boot、/etc 只读，看不到 /home。只用老版本 systemd 也支持的选项：
+# ProtectSystem=strict / PrivateTmp 在 EL8（systemd 239）上会导致开机启动失败（Read-only file system）
+ProtectSystem=full
 ProtectHome=yes
-PrivateTmp=yes
 ExecStartPre=+$OPT/bind-ip.sh
 ExecStartPre=+$OPT/expire.sh
 ExecStartPre=-+$OPT/fw-apply.sh

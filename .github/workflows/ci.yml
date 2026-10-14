@@ -127,7 +127,7 @@ jobs:
           - { image: "debian:12", login: root-key, fw: ufw }
           - { image: "debian:13", login: sudo-pass, fw: none }
           - { image: "ubuntu:22.04", login: root-key, fw: none }
-          - { image: "rockylinux/rockylinux:9", login: sudo-pass, fw: firewalld }
+          - { image: "rockylinux/rockylinux:9", login: root-key, fw: firewalld }
           - { image: "almalinux:8", login: root-key, fw: none }
           - { image: "fedora:41", login: root-key, fw: none }
           - { image: "opensuse/leap:15.6", login: root-key, fw: none }

@@ -313,10 +313,20 @@ for i in 1 2 3 4 5 6; do
   sleep 1
 done
 echo "  累计送达 $total 字节，额度 $limit 字节"
-[ "$total" -le $(( limit + 1048576 )) ] || fail "累计送达 $total 字节，超过了额度"
 [ "$total" -ge $(( 8000000 * 2 )) ] || fail "额度内的下载也被拒绝了（累计只有 $total 字节）"
 [ "$refused" -ge 1 ] || fail "超出额度后没有被拒绝"
-ok "额度内正常使用，超出后被拒绝/截断，累计未超额"
+# 3proxy 在额度边界上偶尔放过一个连接：最多超出一个连接的量
+[ "$total" -le $(( limit + 8000000 )) ] || fail "累计送达 $total 字节，超出额度不止一个连接"
+# 额度守护（每分钟）把额度将尽的账号移出账号表：之后两种协议的新连接都必须被拒绝
+blocked=0
+for _ in $(seq 20); do
+  sleep 5
+  a=$(curl -s -m 10 -o /dev/null -w '%{size_download}' -x "$(px socks "${IPS[0]}" 23000 "$user" "$pass")" "http://$ECHO:8000/bytes?n=1000000" 2>/dev/null || true)
+  b=$(curl -s -m 10 -o /dev/null -w '%{size_download}' -x "$(px http "${IPS[0]}" 23001 "$user" "$pass")" "http://$ECHO:8000/bytes?n=1000000" 2>/dev/null || true)
+  if [ "${a:-0}" -lt 1000000 ] && [ "${b:-0}" -lt 1000000 ] && ! inct "grep -q '^$user:' /etc/aio-proxy/users.active"; then blocked=1; break; fi
+done
+[ $blocked = 1 ] || fail "额度用尽 100 秒后账号仍可使用（额度守护没有生效）"
+ok "额度内正常使用，超出后被拒绝；额度守护在一分钟内停用该账号"
 
 say "11. 卸载"
 run_aio uninstall || fail "卸载失败"

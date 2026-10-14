@@ -239,6 +239,14 @@ Per account. If you want a separate limit for each IP, choose "random account pe
 </details>
 
 <details>
+<summary><b>What happens when a traffic quota runs out?</b></summary>
+
+3proxy caps each connection at the remaining quota: HTTP requests that don't fit are refused, and SOCKS5 transfers stop when the quota is reached. A quota guard also runs on the server every minute: accounts with less than 1 MB left are disabled, and re-enabled automatically when the counting period (day / week / month) resets.
+
+Right at the boundary, an individual connection can occasionally overshoot (observed with 3proxy 1.0.1); the guard disables the account within a minute.
+</details>
+
+<details>
 <summary><b>Will it affect services already running on the server?</b></summary>
 
 It won't overwrite an existing 3proxy, sing-box or similar install. Port conflicts are caught before deployment, and conflicting services are only stopped if you explicitly choose to stop them. Uninstalling reverts every change the app made.
