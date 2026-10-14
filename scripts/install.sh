@@ -48,6 +48,8 @@ verify() {
 
 binary_ok() {
   [ -x "$1" ] || return 1
+  # 必须是 ELF 程序：官方 deb 里还有同名的 /etc/init.d/3proxy 启动脚本
+  [ "$(dd if="$1" bs=1 skip=1 count=3 2>/dev/null)" = ELF ] || return 1
   if has ldd && ldd "$1" 2>&1 | grep -q "not found"; then return 1; fi
   return 0
 }
@@ -80,8 +82,8 @@ install_from_pkg() {
     *.deb) dpkg-deb -x "$T/$pkg" "$T/x" 2>/dev/null || { warn "dpkg-deb 无法解包（系统 dpkg 不支持 zstd）"; return 1; } ;;
     *.rpm) has cpio || pkg_install cpio; (cd "$T/x" && rpm2cpio "$T/$pkg" | cpio -idm --quiet 2>/dev/null) || return 1 ;;
   esac
-  f=$(find "$T/x" -type f -name 3proxy | head -n1)
-  [ -n "$f" ] && binary_ok "$f" || { warn "安装包中的程序无法在本系统运行"; return 1; }
+  f=$(find "$T/x" -type f -name 3proxy | while read -r c; do binary_ok "$c" && { echo "$c"; break; }; done)
+  [ -n "$f" ] || { warn "安装包中的程序无法在本系统运行"; return 1; }
   install -m 0755 "$f" "$BIN.new" && mv -f "$BIN.new" "$BIN"
 }
 
