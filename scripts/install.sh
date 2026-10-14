@@ -283,7 +283,8 @@ cat > "$OPT/expire.sh" <<'EOF'
 E=/etc/aio-proxy
 today=$(date +%Y-%m-%d)
 tmp=$E/users.active.tmp
-awk -v t="$today" 'NR==FNR { if ($2 != "" && $2 < t) x[$1]=1; next }
+# 用 FILENAME 而不是 NR==FNR 区分文件：expiry.list 为空时 NR==FNR 对 users.list 也成立，会吞掉全部账号
+awk -v t="$today" 'FILENAME == ARGV[1] { if ($2 != "" && $2 < t) x[$1]=1; next }
                    { split($0,a,":"); if (!(a[1] in x)) print }' "$E/expiry.list" "$E/users.list" > "$tmp"
 if ! cmp -s "$tmp" "$E/users.active" 2>/dev/null; then
   mv -f "$tmp" "$E/users.active"
