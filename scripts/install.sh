@@ -213,6 +213,9 @@ ok "端口可用"
 cat > "$OPT/bind-ip.sh" <<'EOF'
 #!/bin/sh
 # 把 /etc/aio-proxy/bind.txt 中的地址绑定到网卡（开机/服务启动前执行）
+# 允许绑定尚未就绪的地址（部分系统开机时不加载 /etc/sysctl.d）
+sysctl -q -w net.ipv4.ip_nonlocal_bind=1 >/dev/null 2>&1
+sysctl -q -w net.ipv6.ip_nonlocal_bind=1 >/dev/null 2>&1
 [ -s /etc/aio-proxy/bind.txt ] || exit 0
 while read -r cidr dev; do
   [ -n "$cidr" ] && [ -n "$dev" ] || continue
@@ -385,10 +388,13 @@ else
 fi
 
 # =============================================================== 内核参数
-if [ "$TUNE" = 1 ] || [ "$BBR" = 1 ]; then
-  step "优化内核参数"
-  {
+[ "$TUNE" = 1 ] || [ "$BBR" = 1 ] && step "优化内核参数"
+{
     echo "# AIO Proxy Tools"
+    # 始终开启：允许绑定"暂时还不在网卡上"的地址。开机时额外 IP 可能晚于 3proxy 就绪
+    # （cloud-init、DHCP），否则 3proxy 会在缺失的地址上监听失败且不会重试
+    echo "net.ipv4.ip_nonlocal_bind = 1"
+    echo "net.ipv6.ip_nonlocal_bind = 1"
     if [ "$TUNE" = 1 ]; then
       echo "net.core.somaxconn = 4096"
       echo "net.ipv4.tcp_max_syn_backlog = 4096"
@@ -407,12 +413,11 @@ if [ "$TUNE" = 1 ] || [ "$BBR" = 1 ]; then
         echo "net.ipv4.tcp_congestion_control = bbr"
       fi
     fi
-  } > /etc/sysctl.d/99-aio-proxy.conf
-  sysctl -p /etc/sysctl.d/99-aio-proxy.conf >/dev/null 2>&1 || true
-  if [ "$BBR" = 1 ]; then
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = bbr ]; then ok "BBR 已开启"
-    else warn "内核不支持 BBR，已跳过"; fi
-  fi
+} > /etc/sysctl.d/99-aio-proxy.conf
+sysctl -p /etc/sysctl.d/99-aio-proxy.conf >/dev/null 2>&1 || true
+if [ "$BBR" = 1 ]; then
+  if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = bbr ]; then ok "BBR 已开启"
+  else warn "内核不支持 BBR，已跳过"; fi
 fi
 
 # =============================================================== 服务

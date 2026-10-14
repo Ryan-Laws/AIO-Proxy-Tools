@@ -99,7 +99,7 @@ RUN chmod 0755 /etc/init.d/e2e-ips \\
     else systemctl enable e2e-ips; rm -f /etc/init.d/e2e-ips; fi
 RUN ssh-keygen -A \\
  && mkdir -p /root/.ssh && chmod 700 /root/.ssh \\
- && sed -i 's/^root:[!*]*:/root:*:/' /etc/shadow \\
+ && sed -i 's/^root:[^:]*:/root:*:/' /etc/shadow \\
  && printf 'PermitRootLogin prohibit-password\nPasswordAuthentication yes\nKbdInteractiveAuthentication yes\n' > /tmp/sshd_extra \\
  && if [ -d /etc/ssh/sshd_config.d ]; then cp /tmp/sshd_extra /etc/ssh/sshd_config.d/00-e2e.conf; else cat /tmp/sshd_extra >> /etc/ssh/sshd_config; fi \\
  && useradd -m -s /bin/sh aio 2>/dev/null || adduser -D -s /bin/sh aio \\
@@ -128,6 +128,10 @@ wait_ssh() {
          -o ConnectTimeout=2 root@"$CIP" true 2>/dev/null; then return 0; fi
     sleep 1
   done
+  docker logs --tail 30 $name 2>&1 || true
+  inct 'systemctl is-system-running; systemctl status sshd ssh --no-pager -n 20; ss -ltn; grep -E "^root:" /etc/shadow | cut -c1-12' 2>&1 || true
+  ssh -v -i "$work/key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=3 root@"$CIP" true 2>&1 | tail -n 15 || true
   fail "sshd 没有起来"
 }
 start_ct
@@ -280,9 +284,16 @@ run_aio deploy -ips "${IPS[0]}" -protocol http -http-port 23000 -auth per -quota
   -via-listen -json "$work/d5.json" || fail "部署失败"
 read -r proto ip port user pass < <(proxies "$work/d5.json" | head -n1)
 p=$(px "$proto" "$ip" "$port" "$user" "$pass")
-curl -sS -m 60 -o /dev/null -x "$p" "http://$ECHO:8000/bytes?n=30000000" || true
+got=$(curl -sS -m 60 -o /dev/null -w '%{size_download}' -x "$p" "http://$ECHO:8000/bytes?n=30000000" || true)
+echo "  第一次下载收到 $got 字节（额度 20MB，超出后应被截断或之后被拒绝）"
 sleep 2
-if curl -fsS -m 10 -x "$p" "http://$ECHO:8000/ip" >/dev/null 2>&1; then fail "额度用完后仍能使用"; fi
+counters() {
+  inct 'p=$(sed -n "s/.*\"adminPort\": *\([0-9]*\).*/\1/p" /etc/aio-proxy/proxies.json); u=$(sed -n "s/.*\"adminUser\": *\"\([^\"]*\)\".*/\1/p" /etc/aio-proxy/proxies.json); w=$(sed -n "s/.*\"adminPass\": *\"\([^\"]*\)\".*/\1/p" /etc/aio-proxy/proxies.json); echo "user = \"$u:$w\"" | curl -s -K - "http://127.0.0.1:$p/C" | sed "s/<[^>]*>/ /g" | tr -s " " | grep -i count'
+}
+if curl -fsS -m 10 -x "$p" "http://$ECHO:8000/ip" >/dev/null 2>&1; then
+  echo "  计数器："; counters || true
+  fail "额度用完后仍能使用"
+fi
 ok "额度用完后被拒绝"
 
 say "11. 卸载"

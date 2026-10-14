@@ -487,6 +487,11 @@ server:
   use-syslog: no
   logfile: ""
   verbosity: 0
+
+# 不使用远程控制：显式关闭，否则部分版本（如 Ubuntu 22.04 的 1.13）会尝试读取
+# 默认证书 /etc/unbound/unbound_server.pem，以专用用户运行时没有权限而启动失败
+remote-control:
+  control-enable: no
 `, DNSPort, DNSPort, ip6, threads, msg, rr)
 	if d.Mode == "forward" {
 		b.WriteString("\nforward-zone:\n  name: \".\"\n")
