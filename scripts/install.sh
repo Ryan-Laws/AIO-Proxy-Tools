@@ -329,6 +329,28 @@ install -m 0640 -o root -g "$RUN_GROUP" "$W/expiry.list" "$ETC/expiry.list"
 install -m 0600 "$W/proxies.json" "$ETC/proxies.json"
 echo "${TOOL_VERSION:-unknown}" > "$ETC/version"
 
+# 预先初始化流量计数器记录：3proxy 新建计数器时"周期起点"为 0，第一次落盘（每分钟或重新加载）
+# 会被当作周期已变化而清零，之前统计的用量丢失、额度失效。这里在 3proxy 读取配置前，
+# 给每个尚未初始化的计数器写入"起点=现在、用量=0"。只处理 64 位系统（time_t 为 8 字节）：
+# 文件头 16 字节（"3CF\0" + 4 字节对齐 + 更新时间），每条记录 24 字节（用量、周期起点、更新时间）
+init_counters() {
+  case "$(uname -m)" in x86_64|amd64|aarch64|arm64) ;; *) return 0 ;; esac
+  cf=$VAR/traffic.3cf
+  now=$(date +%s)
+  le64() { v=$1; i=0; while [ $i -lt 8 ]; do printf "\\$(printf '%03o' $(( (v >> (8 * i)) & 255 )))"; i=$((i + 1)); done; }
+  [ -s "$cf" ] || { printf '3CF\000\000\000\000\000'; le64 "$now"; } > "$cf"
+  [ "$(dd if="$cf" bs=1 count=3 2>/dev/null)" = 3CF ] || return 0
+  for n in $(sed -n 's/^count[a-z]* "\([0-9][0-9]*\)\/.*/\1/p' "$ETC/3proxy.cfg"); do
+    off=$(( 16 + (n - 1) * 24 ))
+    cl=$(dd if="$cf" bs=1 skip=$((off + 8)) count=8 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    if [ -z "$cl" ] || [ "$cl" = 0000000000000000 ]; then
+      { le64 0; le64 "$now"; le64 "$now"; } | dd of="$cf" bs=1 seek="$off" conv=notrunc 2>/dev/null
+    fi
+  done
+  chown "$RUN_USER:$RUN_GROUP" "$cf"; chmod 0660 "$cf"
+}
+init_counters
+
 # 到期账号过滤：生成 users.active（3proxy 实际读取的账号表）
 cat > "$OPT/expire.sh" <<'EOF'
 #!/bin/sh
@@ -460,9 +482,8 @@ Group=$RUN_GROUP
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-# 沙箱：/usr、/boot、/etc 只读，看不到 /home。只用老版本 systemd 也支持的选项：
-# ProtectSystem=strict / PrivateTmp 在 EL8（systemd 239）上会导致开机启动失败（Read-only file system）
-ProtectSystem=full
+# 沙箱：看不到 /home。不用 ProtectSystem / PrivateTmp：EL8（systemd 239）上以 + 开头的
+# ExecStartPre 也会受其限制，写不了 /etc/aio-proxy，服务无法启动（Read-only file system）
 ProtectHome=yes
 ExecStartPre=+$OPT/bind-ip.sh
 ExecStartPre=+$OPT/expire.sh
@@ -542,8 +563,7 @@ if ! svc_active "$SVC" || ! all_listening; then
   fi
   die "3proxy 启动失败"
 fi
-ok "3proxy 运行中，$(wc -l < "$W/listen.txt" | tr -d ' ') 个监听全部就绪"
-# 新配置已生效，解绑不再需要的旧地址
+ok "3proxy 运行中，$(wc -l < "$W/listen.txt" | tr -d ' ') 个监听全部就绪"# 新配置已生效，解绑不再需要的旧地址
 if [ -s "$W/unbind.txt" ]; then
   while read -r cidr dev; do ip addr del "$cidr" dev "$dev" 2>/dev/null; done < "$W/unbind.txt"
 fi

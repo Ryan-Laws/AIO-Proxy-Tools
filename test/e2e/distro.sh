@@ -28,7 +28,7 @@ inct() { docker exec "$name" sh -c "$*"; }
 
 dump() {
   say "失败，收集现场"
-  inct 'journalctl -u aio-proxy -u aio-proxy-dns --no-pager -n 80 2>/dev/null || cat /var/log/messages 2>/dev/null | tail -n 80' || true
+  inct 'journalctl -u aio-proxy -u aio-proxy-dns -u aio-proxy-expire --no-pager -n 120 2>/dev/null || cat /var/log/messages 2>/dev/null | tail -n 80' || true
   inct 'ls -la /etc/aio-proxy /opt/aio-proxy /opt/aio-proxy/bin 2>&1; cat /etc/aio-proxy/3proxy.cfg 2>&1 | head -n 60' || true
   inct 'ss -ltnup 2>/dev/null || netstat -ltnup 2>/dev/null' || true
   inct 'ip -br addr; sysctl net.ipv4.ip_nonlocal_bind' || true
@@ -259,7 +259,7 @@ if [ "$fw" != none ]; then
   say "7. 防火墙规则（$fw）"
   case $fw in
     ufw) inct "ufw status | grep -E '21080|21081'" >/dev/null || fail "ufw 没有放行代理端口" ;;
-    firewalld) inct "firewall-cmd --list-ports; firewall-cmd --permanent --list-ports" | grep -q 21080 || fail "firewalld 没有放行代理端口" ;;
+    firewalld) inct "firewall-cmd --permanent --list-ports 2>/dev/null || firewall-offline-cmd --list-ports" | grep -q 21080 || fail "firewalld 没有放行代理端口（永久规则）" ;;
   esac
   ok "已放行代理端口"
 fi
@@ -337,7 +337,7 @@ inct "ss -lnuH | grep ':5335 '" >/dev/null 2>&1 && fail "卸载后 DNS 解析器
 inct "ls /etc/systemd/system/aio-proxy* /etc/init.d/aio-proxy* /etc/sysctl.d/99-aio-proxy.conf /etc/periodic/hourly/aio-proxy* 2>/dev/null" && fail "卸载后还留有服务或系统配置文件"
 case $fw in
   ufw) inct "ufw status | grep -E '2[0-9]{4}'" && fail "卸载后 ufw 规则没有撤销" ;;
-  firewalld) inct "firewall-cmd --permanent --list-ports | grep -E '2[0-9]{4}'" && fail "卸载后 firewalld 规则没有撤销" ;;
+  firewalld) inct "(firewall-cmd --permanent --list-ports 2>/dev/null || firewall-offline-cmd --list-ports) | grep -E '2[0-9]{4}'" && fail "卸载后 firewalld 规则没有撤销" ;;
 esac
 for ip in "${IPS[@]}"; do inct "ip -br addr | grep -q '$ip/'" || fail "卸载把服务器原有的地址 $ip 删掉了"; done
 ok "卸载干净，服务器原有地址保留"
