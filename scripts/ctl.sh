@@ -9,8 +9,12 @@ status() {
   if [ -n "$pid" ] && [ "$pid" != 0 ] && [ -d "/proc/$pid" ]; then
     echo "PID=$pid"
     awk '/^Threads:/{print "THREADS="$2} /^VmRSS:/{print "RSS_KB="$2}' "/proc/$pid/status"
-    if has ss; then echo "CONNS=$(ss -tnpH state established 2>/dev/null | grep -c "pid=$pid,")"; fi
-    if [ $INIT = systemd ]; then echo "SINCE=$(systemctl show -p ActiveEnterTimestamp --value $SVC)"; fi
+    if has ss; then echo "CONNS=$(ss -tnp state established 2>/dev/null | awk 'NR>1' | grep -c "pid=$pid,")"; fi
+    # 启动时间输出 Unix 时间戳：systemctl 输出的时区缩写（如 CST）在浏览器里会被解析错
+    btime=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null)
+    st=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+    hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    [ -n "$btime" ] && [ -n "$st" ] && echo "SINCE=$((btime + st / hz))"
   fi
   [ -f "$ETC/dns.effective" ] && echo "DNS_EFFECTIVE=$(cat "$ETC/dns.effective")"
   [ -f "$OPT/3proxy.version" ] && echo "TP_VERSION=$(cat "$OPT/3proxy.version")"
@@ -22,9 +26,10 @@ stats() {
   user=$(sed -n 's/.*"adminUser": *"\([^"]*\)".*/\1/p' "$ETC/proxies.json" | head -n1)
   pass=$(sed -n 's/.*"adminPass": *"\([^"]*\)".*/\1/p' "$ETC/proxies.json" | head -n1)
   [ -n "$port" ] || { echo "::warn::未找到管理端口"; return; }
+  has curl || pkg_install curl
   echo "::counters::begin"
-  if has curl; then curl -s -m 10 -u "$user:$pass" "http://127.0.0.1:$port/C"
-  else wget -q -T 10 -O - --user="$user" --password="$pass" "http://127.0.0.1:$port/C"; fi
+  # 管理密码经 stdin 传给 curl，不出现在进程列表里
+  echo "user = \"$user:$pass\"" | curl -s -m 10 -K - "http://127.0.0.1:$port/C"
   echo; echo "::counters::end"
 }
 

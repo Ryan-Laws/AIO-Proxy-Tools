@@ -5,13 +5,16 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
+    # 只读权限、不保留令牌：npm ci 会执行依赖的安装脚本，构建阶段不应能改动仓库或 Release
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -20,11 +23,43 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - name: 测试
+        run: |
+          cd web && npm ci && npm run build && cd ..
+          go vet ./...
+          go test ./...
       - name: 构建全部平台
-        run: ./build.sh "${GITHUB_REF_NAME}"
-      - name: 发布
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: ./build.sh "$VERSION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    # 只下载构建产物并发布，不执行任何第三方代码
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - name: 校验并发布
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/*.tar.gz dist/SHA256SUMS \
-            --title "AIO Proxy Tools ${GITHUB_REF_NAME}" --generate-notes
+          (cd dist && sha256sum -c SHA256SUMS)
+          pre=""
+          case "$TAG" in *-*) pre="--prerelease" ;; esac
+          gh release create "$TAG" dist/*.zip dist/*.tar.gz dist/SHA256SUMS \
+            -R "$REPO" --title "AIO Proxy Tools $TAG" --generate-notes $pre

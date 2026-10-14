@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"crypto/rand"
+	"encoding/csv"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -43,6 +44,11 @@ type App struct {
 	Bus     *task.Bus
 	Tasks   *task.Manager
 	Fetcher *release.Fetcher
+
+	// Ephemeral 为 true 时不把服务器列表写回磁盘（命令行模式用，避免影响图形界面保存的列表）
+	Ephemeral bool
+	// LocalViaListen 为 true 时本机测试直接连接服务器网卡地址而不是公网地址（本机与服务器在同一内网时）
+	LocalViaListen bool
 
 	mu      sync.Mutex
 	servers map[string]*Server
@@ -174,7 +180,7 @@ func (a *App) View(id string) (model.ServerView, error) {
 
 func (a *App) persist() {
 	a.mu.Lock()
-	save := a.prefs.SaveHistory
+	save := a.prefs.SaveHistory && !a.Ephemeral
 	ids := append([]string(nil), a.order...)
 	a.mu.Unlock()
 	if !save {
@@ -199,9 +205,11 @@ func normalizeInput(in *model.ServerInput) error {
 	in.Host = strings.TrimSpace(in.Host)
 	in.User = strings.TrimSpace(in.User)
 	in.Name = strings.TrimSpace(in.Name)
-	if h, p, err := net.SplitHostPort(in.Host); err == nil && in.Port == 0 {
-		in.Host = h
-		in.Port, _ = strconv.Atoi(p)
+	// 主机栏里写了端口（1.2.3.4:2222、[2001:db8::1]:2222）时以它为准：界面总会带上默认端口 22
+	if h, p, err := net.SplitHostPort(in.Host); err == nil {
+		if n, err := strconv.Atoi(p); err == nil {
+			in.Host, in.Port = h, n
+		}
 	}
 	in.Host = strings.Trim(in.Host, "[]")
 	if in.Host == "" {
@@ -366,6 +374,20 @@ func (a *App) CreateVault(pw string) error {
 	return nil
 }
 
+// ResetVault 删除保险箱，并取消所有服务器的"记住密码"（否则之后编辑它们会被要求先创建保险箱）
+func (a *App) ResetVault() error {
+	if err := a.Store.ResetVault(); err != nil {
+		return err
+	}
+	for _, v := range a.List() {
+		if s, err := a.get(v.ID); err == nil && v.Remember {
+			a.update(s, func(v *model.ServerView) { v.Remember = false })
+		}
+	}
+	a.persist()
+	return nil
+}
+
 func (a *App) UnlockVault(pw string) error {
 	m, err := a.Store.UnlockVault(pw)
 	if err != nil {
@@ -401,41 +423,48 @@ func ParseBatch(text string, defPort int, defUser, authType string) ([]model.Ser
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		var f []string
-		if strings.Contains(line, ",") {
-			for _, x := range strings.Split(line, ",") {
-				f = append(f, strings.TrimSpace(x))
+		in := model.ServerInput{Port: defPort, User: defUser, AuthType: authType}
+		// 逗号出现在第一个空白之前才是 CSV（host,port,user,password，支持引号）；
+		// 否则按空格分隔：host[:port] [user] [password]，密码取用户名之后的全部内容（可含逗号、空格）
+		comma, ws := strings.Index(line, ","), strings.IndexAny(line, " \t")
+		if comma >= 0 && (ws < 0 || comma < ws) {
+			r := csv.NewReader(strings.NewReader(line))
+			r.FieldsPerRecord, r.TrimLeadingSpace = -1, true
+			f, err := r.Read()
+			if err != nil || len(f) == 0 {
+				errs = append(errs, fmt.Sprintf("第 %d 行: CSV 格式不正确", i+1))
+				continue
 			}
-			if strings.EqualFold(f[0], "host") {
+			if strings.EqualFold(strings.TrimSpace(f[0]), "host") {
 				continue // CSV 表头
 			}
-		} else {
-			f = strings.Fields(line)
-		}
-		in := model.ServerInput{Port: defPort, User: defUser, AuthType: authType}
-		host := f[0]
-		if h, p, err := net.SplitHostPort(host); err == nil {
-			host = h
-			in.Port, _ = strconv.Atoi(p)
-		}
-		in.Host = host
-		rest := f[1:]
-		// CSV: host,port,user,password
-		if len(rest) > 0 && strings.Contains(line, ",") {
-			if p, err := strconv.Atoi(rest[0]); err == nil {
+			in.Host = strings.TrimSpace(f[0])
+			if len(f) > 1 && strings.TrimSpace(f[1]) != "" {
+				p, err := strconv.Atoi(strings.TrimSpace(f[1]))
+				if err != nil {
+					errs = append(errs, fmt.Sprintf("第 %d 行: 端口 %q 无效", i+1, f[1]))
+					continue
+				}
 				in.Port = p
-				rest = rest[1:]
-			} else if rest[0] == "" {
-				rest = rest[1:]
 			}
-		}
-		if len(rest) > 0 && rest[0] != "" {
-			in.User = rest[0]
-		}
-		if len(rest) > 1 {
-			in.Password = strings.Join(rest[1:], " ")
-			if strings.Contains(line, ",") {
-				in.Password = rest[1]
+			if len(f) > 2 && strings.TrimSpace(f[2]) != "" {
+				in.User = strings.TrimSpace(f[2])
+			}
+			if len(f) > 3 {
+				in.Password = f[3]
+			}
+		} else {
+			host, rest, _ := strings.Cut(line, " ")
+			if ws >= 0 {
+				host, rest = line[:ws], strings.TrimLeft(line[ws:], " \t")
+			}
+			in.Host = host
+			if rest != "" {
+				user, pass, _ := strings.Cut(rest, " ")
+				if j := strings.IndexAny(rest, " \t"); j >= 0 {
+					user, pass = rest[:j], strings.TrimLeft(rest[j:], " \t")
+				}
+				in.User, in.Password = user, pass
 			}
 		}
 		if err := normalizeInput(&in); err != nil {

@@ -338,11 +338,11 @@ func (a *App) Plan(id string, req model.PlanRequest) (model.PlanResult, error) {
 		return model.PlanResult{}, err
 	}
 	if len(req.Edited) > 0 {
-		res := model.PlanResult{Proxies: req.Edited, Errors: plan.Validate(req.Edited, in)}
+		res := model.PlanResult{Proxies: req.Edited, Errors: append(plan.ValidateSettings(req.Settings), plan.Validate(req.Edited, in)...)}
 		res.Ports = plan.PortSummary(req.Edited, req.Settings.UDP)
 		return res, nil
 	}
-	key := planKey(req, in.Existing)
+	key := planKey(req, in)
 	s.mu.Lock()
 	if s.lastPlanKey == key {
 		res := s.lastPlan
@@ -357,12 +357,16 @@ func (a *App) Plan(id string, req model.PlanRequest) (model.PlanResult, error) {
 	return res, nil
 }
 
-func planKey(req model.PlanRequest, m *model.Manifest) string {
+// planKey 标识一次预览的全部输入：任何一项变化（含重新探测得到的地址和端口占用）都要重新生成
+func planKey(req model.PlanRequest, in plan.Input) string {
 	b, _ := json.Marshal(struct {
-		S   model.Settings
-		Sel []string
-		M   time.Time
-	}{req.Settings, req.Selected, manifestTime(m)})
+		S      model.Settings
+		Sel    []string
+		M      time.Time
+		Addrs  []model.Addr
+		Listen []string
+		Admin  int
+	}{req.Settings, req.Selected, manifestTime(in.Existing), in.Addrs, in.Listening, in.AdminPort})
 	return string(b)
 }
 
@@ -386,7 +390,8 @@ func (a *App) Deploy(id string, req model.PlanRequest, batch bool) (string, erro
 	}
 	return a.run(id, "deploy", batch, func(ctx context.Context, t *task.Task, s *Server) error {
 		err := a.deploy(ctx, t, s, req)
-		if err != nil {
+		var ve validationError
+		if err != nil && !errors.As(err, &ve) {
 			a.setError(s, err)
 		}
 		return err
@@ -422,7 +427,7 @@ func (a *App) deploy(ctx context.Context, t *task.Task, s *Server, req model.Pla
 		for _, e := range res.Errors {
 			t.Error(e)
 		}
-		return fmt.Errorf("配置有 %d 处错误，未部署", len(res.Errors))
+		return validationError{fmt.Sprintf("配置有 %d 处错误，未部署", len(res.Errors))}
 	}
 	a.update(s, func(v *model.ServerView) { v.State = "deploying"; v.Error = "" })
 
@@ -436,18 +441,32 @@ func (a *App) deploy(ctx context.Context, t *task.Task, s *Server, req model.Pla
 		Version: 1, Tool: "AIO Proxy Tools " + a.Version, UpdatedAt: time.Now(),
 		Settings: req.Settings, Proxies: res.Proxies, AdminPort: adminPort,
 	}
-	if old != nil && old.AdminUser != "" {
+	if old != nil {
+		m.MaxSlot = old.MaxSlot
+	}
+	for _, p := range m.Proxies {
+		if p.Slot > m.MaxSlot {
+			m.MaxSlot = p.Slot
+		}
+	}
+	// 管理账号沿用服务器上旧清单里的（需校验：清单来自服务器，不可信）
+	if old != nil && plan.ValidCred(old.AdminUser, 1) && plan.ValidCred(old.AdminPass, 8) {
 		m.AdminUser, m.AdminPass = old.AdminUser, old.AdminPass
 	} else {
 		m.AdminUser, m.AdminPass = "aioadm"+newID(3), newID(12)
 	}
 	hasV6 := false
+	var own []string
 	for _, ad := range info.Addrs {
 		if ad.Family == 6 && ad.Source == "nic" {
 			hasV6 = true
 		}
+		own = append(own, ad.IP)
+		if ad.Public != "" {
+			own = append(own, ad.Public)
+		}
 	}
-	b, err := threeproxy.Render(m, threeproxy.Options{ToolVersion: a.Version, CPUs: info.CPUs, MemMB: info.MemMB, HasIPv6: hasV6})
+	b, err := threeproxy.Render(m, threeproxy.Options{ToolVersion: a.Version, CPUs: info.CPUs, MemMB: info.MemMB, HasIPv6: hasV6, OwnAddrs: own})
 	if err != nil {
 		return err
 	}
@@ -476,19 +495,18 @@ func (a *App) deploy(ctx context.Context, t *task.Task, s *Server, req model.Pla
 		t.Step("服务器无法从 GitHub 下载 3proxy，改由本机下载后上传")
 		got := 0
 		for _, n := range needs {
-			for _, name := range []string{n.sums, n.file} {
-				if _, ok := b.Files["assets/"+name]; ok {
-					continue
-				}
-				data, ferr := a.Fetcher.Get(ctx, threeproxy.Version, name, n.sums)
-				if ferr != nil {
-					t.Warn(ferr.Error())
-					continue
-				}
-				b.Files["assets/"+name] = data
-				got++
-				t.OK(fmt.Sprintf("已下载并校验 %s（%d KB）", name, len(data)/1024))
+			if _, ok := b.Files["assets/"+n.file]; ok {
+				continue
 			}
+			// 文件名来自服务器输出：Fetcher 只接受内置校验清单里的文件名
+			data, ferr := a.Fetcher.Get(ctx, n.file, strings.TrimSpace(req.Settings.GitHubMirror))
+			if ferr != nil {
+				t.Warn(ferr.Error())
+				continue
+			}
+			b.Files["assets/"+n.file] = data
+			got++
+			t.OK(fmt.Sprintf("已下载并校验 %s（%d KB）", n.file, len(data)/1024))
 		}
 		if got == 0 {
 			return errors.New("本机也无法下载 3proxy，请检查网络或在设置中填写 GitHub 镜像")
@@ -509,7 +527,10 @@ func (a *App) deploy(ctx context.Context, t *task.Task, s *Server, req model.Pla
 		v.Manifest = m
 		v.State = "deployed"
 		v.Tests = tests
-		v.Info.Installed = true
+		// 复制后再改：其它快照仍指向旧的 Info
+		ni := *v.Info
+		ni.Installed = true
+		v.Info = &ni
 	})
 
 	// 本机实测
@@ -517,15 +538,21 @@ func (a *App) deploy(ctx context.Context, t *task.Task, s *Server, req model.Pla
 	return nil
 }
 
-type need struct{ kind, file, sums string }
+// validationError 表示设置没通过校验、什么都没做：不应把服务器标成错误状态
+type validationError struct{ msg string }
 
+func (e validationError) Error() string { return e.msg }
+
+type need struct{ kind, file string }
+
+// parseNeeds 解析服务器输出的 "::need::<pkg|src> <文件名>"
 func parseNeeds(out string) []need {
 	var res []need
 	for _, line := range strings.Split(out, "\n") {
 		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "::need::"); ok {
 			f := strings.Fields(v)
-			if len(f) == 3 {
-				res = append(res, need{f[0], f[1], f[2]})
+			if len(f) >= 2 {
+				res = append(res, need{f[0], f[1]})
 			}
 		}
 	}
@@ -582,7 +609,7 @@ func (a *App) localTest(ctx context.Context, t *task.Task, s *Server, ps []model
 	t.Progress(0, len(ps))
 	var mu sync.Mutex
 	var res []model.TestResult
-	tester.TestAll(ctx, ps, 32, false, func(r model.TestResult) {
+	tester.TestAll(ctx, ps, 32, a.LocalViaListen, func(r model.TestResult) {
 		mu.Lock()
 		res = append(res, r)
 		mu.Unlock()
@@ -625,9 +652,7 @@ func (a *App) Test(id, where string, batch bool) (string, error) {
 		if m == nil || len(m.Proxies) == 0 {
 			return errors.New("该服务器还没有部署代理")
 		}
-		if where == "local" || where == "both" || where == "" {
-			a.localTest(ctx, t, s, m.Proxies)
-		}
+		// 先做服务器自检：本机测试失败时要用最新的自检结果判断是否为安全组问题
 		if where == "server" || where == "both" {
 			c, err := a.client(ctx, s, false)
 			if err != nil {
@@ -659,6 +684,9 @@ func (a *App) Test(id, where string, batch bool) (string, error) {
 			} else {
 				t.Warn(fmt.Sprintf("服务器自检通过 %d/%d", okc, len(res)))
 			}
+		}
+		if where == "local" || where == "both" || where == "" {
+			a.localTest(ctx, t, s, m.Proxies)
 		}
 		return nil
 	})
@@ -717,7 +745,10 @@ func parseStatus(out string) *model.ServiceStatus {
 		case "CONNS":
 			st.Connections, _ = strconv.Atoi(v)
 		case "SINCE":
-			st.Since = v
+			// 服务器输出 Unix 时间戳，转成 RFC3339 交给前端（避免时区缩写解析错误）
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+				st.Since = time.Unix(n, 0).UTC().Format(time.RFC3339)
+			}
 		}
 	}
 	if !found {

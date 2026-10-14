@@ -138,6 +138,8 @@ type Manifest struct {
 	AdminUser    string    `json:"adminUser"`
 	AdminPass    string    `json:"adminPass"`
 	DNSEffective string    `json:"dnsEffective"`
+	// MaxSlot 是历史上分配过的最大流量计数槽位：只增不减，避免新账号继承已删除账号的流量
+	MaxSlot int `json:"maxSlot,omitempty"`
 }
 
 // ---------- 测试与统计 ----------

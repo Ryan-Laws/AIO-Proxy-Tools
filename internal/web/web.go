@@ -63,7 +63,11 @@ func (s *Server) Handler() http.Handler {
 		if err := decode(r, &q); err != nil {
 			return nil, err
 		}
-		return a.VaultState(), a.CreateVault(q.Password)
+		// 先创建再取状态（Go 从左到右求值，写成一行会返回创建前的状态）
+		if err := a.CreateVault(q.Password); err != nil {
+			return nil, err
+		}
+		return a.VaultState(), nil
 	})
 	api("POST /api/vault/unlock", func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var q pwReq
@@ -80,7 +84,10 @@ func (s *Server) Handler() http.Handler {
 		return a.VaultState(), nil
 	})
 	api("POST /api/vault/reset", func(w http.ResponseWriter, r *http.Request) (any, error) {
-		return a.VaultState(), a.Store.ResetVault()
+		if err := a.ResetVault(); err != nil {
+			return nil, err
+		}
+		return a.VaultState(), nil
 	})
 
 	// 服务器
@@ -251,7 +258,9 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			tok := r.Header.Get("X-Token")
-			if tok == "" {
+			// 查询参数里的令牌只给 SSE 用（EventSource 无法设置请求头）。其它接口必须用请求头：
+			// 跨站页面发不出带自定义头的请求（会触发 CORS 预检而被拦），即使令牌泄露或固定（-dev）也无法 CSRF
+			if tok == "" && r.Method == http.MethodGet && r.URL.Path == "/api/events" {
 				tok = r.URL.Query().Get("t")
 			}
 			if subtle.ConstantTimeCompare([]byte(tok), []byte(s.Token)) != 1 {

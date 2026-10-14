@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/netip"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -16,6 +18,36 @@ import (
 
 // Version 是部署的 3proxy 版本。官方发布提供 deb/rpm/源码及 SHA256 校验文件。
 const Version = "1.0.1"
+
+// Pinned 是 3proxy 官方发布文件的 SHA256，写死在程序里作为信任根：
+// 不信任下载来的 SHA256SUMS（它和安装包来自同一渠道，镜像或中间人可以一起替换）。
+// 取自官方 SHA256SUMS-*，并与 GitHub 记录的资产摘要逐一核对过。
+var Pinned = map[string]string{
+	"3proxy-1.0.1.x86_64.deb":       "230e63119b0655b0738cd1fcb3cff5f87289d943efb3d2519705548e25c1e908",
+	"3proxy-1.0.1.arm64.deb":        "a898b0b324734247584db2dd5830aae9b700222e20a4a91c7f967a353fee79bd",
+	"3proxy-1.0.1.arm.deb":          "35d8d36cafc0501600e906b572933ac7c92317261fb045e16ca11402210c8da8",
+	"3proxy-1.0.1.el8.x86_64.rpm":   "8998d11974e4428ebfcee3886584d2c3c6d3ee6bd491480a5d5231976996a856",
+	"3proxy-1.0.1.el9.x86_64.rpm":   "9017818d1693ce32583140bbf1718cc785668d2bcea182934d3cfafee3569da3",
+	"3proxy-1.0.1.el10.x86_64.rpm":  "7c813c22651b085726479ac0ff375a302fbba356ecf76c50b4a1f198c672a676",
+	"3proxy-1.0.1.el8.aarch64.rpm":  "227f01ab86151fe2cd3daa72ecc9c157ee42d586e1518f07a6e9bf8dbfba72aa",
+	"3proxy-1.0.1.el9.aarch64.rpm":  "21aeee1669d577034bae363ca97a492cd078e7445ba9533969d1a53bd14b2df0",
+	"3proxy-1.0.1.el10.aarch64.rpm": "4d421aae9ae9f936830723aff3ffd2926fc7f99ed0ded06e34b90c89f1b081d5",
+	"3proxy-1.0.1.tar.gz":           "cad64e3238db68f0f868176923f541adfb3a711e27776b89b9fbdec4bd8d0d7f",
+}
+
+// PinnedSums 以 sha256sum 的格式输出 Pinned，供服务器端脚本校验。
+func PinnedSums() []byte {
+	names := make([]string, 0, len(Pinned))
+	for n := range Pinned {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, n := range names {
+		fmt.Fprintf(&b, "%s  %s\n", Pinned[n], n)
+	}
+	return []byte(b.String())
+}
 
 // DNSPort 是本机 unbound 监听端口（避开 53，避免与 systemd-resolved/dnsmasq 冲突）。
 const DNSPort = 5335
@@ -27,7 +59,12 @@ var DefaultForwarders = []string{"1.1.1.1", "9.9.9.9", "1.0.0.1", "149.112.112.1
 var ECSResolvers = map[string]bool{"8.8.8.8": true, "8.8.4.4": true, "9.9.9.11": true, "149.112.112.11": true,
 	"2001:4860:4860::8888": true, "2001:4860:4860::8844": true}
 
-var privateTargets = "0.0.0.0/8,10.0.0.0/8,100.64.0.0/10,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16,224.0.0.0/4,::1/128,fc00::/7,fe80::/10"
+// alwaysDeny 无论设置如何都禁止经代理访问：服务器本机回环、链路本地（含云厂商元数据服务
+// 169.254.169.254 / fd00:ec2::254）、阿里云元数据 100.100.100.200、未指定地址
+var alwaysDeny = "0.0.0.0/8,127.0.0.0/8,169.254.0.0/16,100.100.100.200/32,::/128,::1/128,fe80::/10,fd00:ec2::254/128"
+
+// privateTargets 是"禁止访问内网"开启时额外禁止的网段
+var privateTargets = "10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.0.0.0/24,192.168.0.0/16,224.0.0.0/4,240.0.0.0/4,fc00::/7,::ffff:0:0/96"
 
 // Options 是渲染时需要的服务器上下文。
 type Options struct {
@@ -35,6 +72,55 @@ type Options struct {
 	CPUs        int
 	MemMB       int
 	HasIPv6     bool
+	// OwnAddrs 是服务器自己的全部地址（网卡地址与公网地址），禁止经代理访问，
+	// 否则代理用户可绕过云安全组访问服务器上只对本机开放的服务
+	OwnAddrs []string
+}
+
+// addrsOf 用清单自身的监听地址构造地址表（Render 只需校验字段格式，不校验是否属于服务器）
+func addrsOf(ps []model.Proxy) []model.Addr {
+	var out []model.Addr
+	for _, p := range ps {
+		out = append(out, model.Addr{IP: p.Listen})
+	}
+	return out
+}
+
+// ownDeny 把服务器自己的地址压缩成 deny 列表：同一 /24（IPv6 为 /64）超过 4 个地址时用整段
+func ownDeny(addrs []string) string {
+	groups := map[netip.Prefix][]netip.Addr{}
+	for _, s := range addrs {
+		a, err := netip.ParseAddr(s)
+		if err != nil {
+			continue
+		}
+		a = a.Unmap()
+		bits := 24
+		if a.Is6() {
+			bits = 64
+		}
+		p, _ := a.Prefix(bits)
+		groups[p] = append(groups[p], a)
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for p, as := range groups {
+		if len(as) > 4 {
+			add(p.String())
+			continue
+		}
+		for _, a := range as {
+			add(netip.PrefixFrom(a, a.BitLen()).String())
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
 }
 
 // Bundle 是一次部署上传到服务器的全部文件与环境变量。
@@ -50,6 +136,14 @@ func Render(m *model.Manifest, o Options) (*Bundle, error) {
 	if len(ps) == 0 {
 		return nil, fmt.Errorf("代理清单为空")
 	}
+	// 最后一道防线：写进配置和脚本的字段不得含空白、引号或控制字符（plan.Validate 已做完整校验）
+	if errs := append(plan.ValidateSettings(s), plan.Validate(ps, plan.Input{Addrs: addrsOf(ps)})...); len(errs) > 0 {
+		return nil, fmt.Errorf("配置不合法: %s", strings.Join(errs, "；"))
+	}
+	if !plan.ValidCred(m.AdminUser, 1) || !plan.ValidCred(m.AdminPass, 8) {
+		return nil, fmt.Errorf("统计接口账号不合法")
+	}
+	own := ownDeny(o.OwnAddrs)
 	var cfg strings.Builder
 	w := func(f string, a ...any) { fmt.Fprintf(&cfg, f+"\n", a...) }
 
@@ -143,8 +237,10 @@ func Render(m *model.Manifest, o Options) (*Bundle, error) {
 		w("flush")
 		if s.BlockPrivate {
 			w("deny * * %s", privateTargets)
-		} else {
-			w("deny * * 127.0.0.0/8,::1/128") // 始终禁止经代理访问服务器本机服务
+		}
+		w("deny * * %s", alwaysDeny)
+		if own != "" {
+			w("deny * * %s", own)
 		}
 		users := p.User
 		if users == "" {
@@ -255,6 +351,7 @@ func Render(m *model.Manifest, o Options) (*Bundle, error) {
 			"fw.txt":       []byte(fw.String()),
 			"bind.txt":     []byte(bind.String()),
 			"selftest.txt": []byte(selftest.String()),
+			"pinned.sums":  PinnedSums(),
 		},
 		Env: map[string]string{
 			"TP_VERSION":     Version,

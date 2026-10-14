@@ -41,11 +41,13 @@ APT_UPDATED=0
 pkg_install() {
   case "$PM" in
     apt-get)
-      if [ $APT_UPDATED = 0 ]; then DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; APT_UPDATED=1; fi
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$@" >/dev/null 2>&1 ;;
+      # 新开的机器常有 unattended-upgrades 占着 dpkg 锁：等锁而不是直接失败
+      if [ $APT_UPDATED = 0 ]; then DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null 2>&1; APT_UPDATED=1; fi
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq --no-install-recommends "$@" >/dev/null 2>&1 ;;
     dnf|yum) $PM install -y -q "$@" >/dev/null 2>&1 ;;
     apk)     apk add --no-cache -q "$@" >/dev/null 2>&1 ;;
-    pacman)  pacman -Sy --noconfirm --needed "$@" >/dev/null 2>&1 ;;
+    # 不用 -Sy：只刷新数据库不升级会造成部分升级；先直接装，数据库过旧时才整体升级
+    pacman)  pacman -S --noconfirm --needed "$@" >/dev/null 2>&1 || pacman -Syu --noconfirm --needed "$@" >/dev/null 2>&1 ;;
     zypper)  zypper -n -q install "$@" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
@@ -78,11 +80,12 @@ svc_restart() { case $INIT in systemd) systemctl restart "$1" ;; openrc) rc-serv
 svc_enable()  { case $INIT in systemd) systemctl enable "$1" >/dev/null 2>&1 ;; openrc) rc-update add "$1" default >/dev/null 2>&1 ;; esac; true; }
 svc_disable() { case $INIT in systemd) systemctl disable "$1" >/dev/null 2>&1 ;; openrc) rc-update del "$1" default >/dev/null 2>&1 ;; esac; true; }
 
+# 3proxy 主进程 PID。OpenRC 的 supervise-daemon pidfile 记的是监督进程，不能用
 main_pid() {
-  case $INIT in
-    systemd) systemctl show -p MainPID --value "$SVC" 2>/dev/null ;;
-    *) [ -f /run/$SVC.pid ] && cat /run/$SVC.pid ;;
-  esac
+  pid=""
+  [ $INIT = systemd ] && pid=$(systemctl show -p MainPID "$SVC" 2>/dev/null | cut -d= -f2)
+  if [ -z "$pid" ] || [ "$pid" = 0 ]; then pid=$(pgrep -o -f "^$BIN " 2>/dev/null); fi
+  echo "$pid"
 }
 
 # 下载：$1=URL $2=输出文件
@@ -102,7 +105,8 @@ sha256_of() {
 listening_sockets() {
   own=$(main_pid)
   if has ss; then
-    ss -ltnpH 2>/dev/null | { if [ -n "$own" ] && [ "$own" != 0 ]; then grep -v "pid=$own,"; else cat; fi; } | awk '{print $4}'
+    # 不用 ss -H：老版本 iproute2（CentOS 7）不支持
+    ss -ltnp 2>/dev/null | awk 'NR>1' | { if [ -n "$own" ] && [ "$own" != 0 ]; then grep -v "pid=$own,"; else cat; fi; } | awk '{print $4}'
   elif has netstat; then
     netstat -ltnp 2>/dev/null | awk 'NR>2{print $4" "$7}' | { if [ -n "$own" ] && [ "$own" != 0 ]; then grep -v " $own/"; else cat; fi; } | awk '{print $1}'
   fi | sed -E 's/^\[?(.*)\]?:([0-9]+)$/\1 \2/; s/\]//; s/%[^ ]*//'
@@ -115,15 +119,16 @@ selftest() {
   host=$listen; case "$listen" in *:*) host="[$listen]" ;; esac
   if [ "$fam" = 6 ]; then url=https://api64.ipify.org; else url=https://api.ipify.org; fi
   case "$proto" in socks) scheme=socks5h ;; *) scheme=http ;; esac
-  cred=""; [ "$user" != "-" ] && cred="$user:$pass@"
+  # 账号经 stdin 传给 curl，不出现在进程列表里
+  cred=""; [ "$user" != "-" ] && cred="proxy-user = \"$user:$pass\""
   t0=$(date +%s%N 2>/dev/null)
-  r=$(curl -s -m 12 -x "$scheme://$cred$host:$port" "$url" 2>/dev/null | tr -d ' \r\n')
+  r=$(echo "$cred" | curl -s -m 12 -K - -x "$scheme://$host:$port" "$url" 2>/dev/null | tr -d ' \r\n')
   t1=$(date +%s%N 2>/dev/null)
   ms=0; case "$t0$t1" in *N*) ;; *) ms=$(( (t1 - t0) / 1000000 )) ;; esac
   case "$r" in
     ""|*[!0-9a-fA-F.:]*)
       # 区分 DNS 问题：直接用 IP 访问
-      r2=$(curl -s -m 8 -x "$scheme://$cred$host:$port" -o /dev/null -w '%{http_code}' https://1.1.1.1/cdn-cgi/trace 2>/dev/null)
+      r2=$(echo "$cred" | curl -s -m 8 -K - -x "$scheme://$host:$port" -o /dev/null -w '%{http_code}' https://1.1.1.1/cdn-cgi/trace 2>/dev/null)
       if [ "$r2" = 200 ]; then echo "::test::$id fail DNS ${ms}"; else echo "::test::$id fail CONNECT ${ms}"; fi ;;
     *) echo "::test::$id ok $r ${ms}" ;;
   esac

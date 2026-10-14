@@ -1,20 +1,17 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Ryan-Laws/AIO-Proxy-Tools/internal/app"
 	"github.com/Ryan-Laws/AIO-Proxy-Tools/internal/model"
 	"github.com/Ryan-Laws/AIO-Proxy-Tools/internal/store"
-	"github.com/Ryan-Laws/AIO-Proxy-Tools/internal/tester"
 )
 
 // runCLI 实现无界面的命令行模式，适合无桌面环境与自动化测试。
@@ -38,6 +35,7 @@ func runCLI(cmd string, args []string) int {
 	authUser := fs.String("auth-user", "", "自定义用户名（-auth custom）")
 	authPassEnv := fs.String("auth-pass-env", "AIO_PROXY_PASSWORD", "自定义代理密码所在的环境变量")
 	ips := fs.String("ips", "", "要使用的 IP（逗号分隔），留空则使用所有出口正常的 IPv4")
+	whitelist := fs.String("whitelist", "", "来源 IP 白名单（逗号分隔，IP 或 CIDR），常与 -auth none 搭配")
 	dns := fs.String("dns", "recursive", "recursive | forward | public | system")
 	speed := fs.Float64("speed", 0, "每账号限速 Mbps，0 不限")
 	maxConn := fs.Int("max-conn", 0, "每账号最大并发，0 不限")
@@ -70,10 +68,9 @@ func runCLI(cmd string, args []string) int {
 		return 1
 	}
 	a := app.New(version, st)
-	// 命令行模式不写服务器历史
-	p := a.Prefs()
-	p.SaveHistory = false
-	a.SetPrefs(p)
+	// 命令行模式只在内存里操作：不写偏好、不改动图形界面保存的服务器列表
+	a.Ephemeral = true
+	a.LocalViaListen = *viaListen
 
 	views, err := a.AddServers([]model.ServerInput{in})
 	if err != nil {
@@ -129,6 +126,9 @@ func runCLI(cmd string, args []string) int {
 			s.Auth.User, s.Auth.Pass = *authUser, os.Getenv(*authPassEnv)
 		}
 		s.DNS.Mode = *dns
+		if *whitelist != "" {
+			s.Whitelist = strings.Split(*whitelist, ",")
+		}
 		s.Limits = model.Limits{SpeedMbps: *speed, MaxConn: *maxConn, QuotaGB: *quota, QuotaPeriod: "M"}
 		s.Firewall, s.BBR, s.BlockPrivate = !*noFW, !*noBBR, !*allowPrivate
 		var sel []string
@@ -164,18 +164,13 @@ func runCLI(cmd string, args []string) int {
 			results[t.ProxyID] = t
 		}
 	}
-	if *viaListen {
-		var mu sync.Mutex
-		tester.TestAll(context.Background(), v.Manifest.Proxies, 32, true, func(r model.TestResult) {
-			mu.Lock()
-			results[r.ProxyID] = r
-			mu.Unlock()
-		})
-	}
 	var lines []string
 	fmt.Println()
 	for _, p := range v.Manifest.Proxies {
 		host := p.Public
+		if *viaListen || host == "" {
+			host = p.Listen
+		}
 		if strings.Contains(host, ":") {
 			host = "[" + host + "]"
 		}
@@ -189,11 +184,17 @@ func runCLI(cmd string, args []string) int {
 		fmt.Printf("%-6s %s  %s\n", strings.ToUpper(p.Protocol), line, mark)
 	}
 	if *out != "" {
-		os.WriteFile(*out, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
+		if err := os.WriteFile(*out, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "写入", *out, "失败:", err)
+			return 1
+		}
 	}
 	if *jsonOut != "" {
 		b, _ := json.MarshalIndent(v, "", "  ")
-		os.WriteFile(*jsonOut, b, 0o600)
+		if err := os.WriteFile(*jsonOut, b, 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "写入", *jsonOut, "失败:", err)
+			return 1
+		}
 	}
 	if failed > 0 {
 		fmt.Fprintf(os.Stderr, "\n%d 个代理本机测试未通过\n", failed)

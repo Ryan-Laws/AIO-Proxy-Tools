@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"fmt"
 	"math/big"
+	"net"
 	"net/netip"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Ryan-Laws/AIO-Proxy-Tools/internal/model"
 	"github.com/Ryan-Laws/AIO-Proxy-Tools/internal/netx"
@@ -106,6 +108,7 @@ func Build(in Input) model.PlanResult {
 	existing := map[key]model.Proxy{}
 	maxSlot := 0
 	if in.Existing != nil {
+		maxSlot = in.Existing.MaxSlot
 		for _, p := range in.Existing.Proxies {
 			existing[key{p.Listen, p.Protocol}] = p
 			if p.Slot > maxSlot {
@@ -143,10 +146,23 @@ func Build(in Input) model.PlanResult {
 	}
 
 	// 账号
+	res.Errors = append(res.Errors, ValidateSettings(s)...)
+	if len(res.Errors) > 0 {
+		return res
+	}
 	var shared model.Cred
 	switch s.Auth.Mode {
 	case "shared":
 		shared = model.Cred{User: genUser(s.Auth), Pass: randString(alnum, passLen(s.Auth))}
+		// 沿用已部署的共享账号（之前也是共享模式时），保证所有 IP 仍是同一个账号
+		if s.KeepExisting && in.Existing != nil && in.Existing.Settings.Auth.Mode == "shared" {
+			for _, p := range in.Existing.Proxies {
+				if p.User != "" {
+					shared = model.Cred{User: p.User, Pass: p.Pass}
+					break
+				}
+			}
+		}
 	case "custom":
 		if !ValidCred(s.Auth.User, 1) {
 			errf("自定义用户名只能包含字母、数字和 . _ -")
@@ -167,18 +183,11 @@ func Build(in Input) model.PlanResult {
 		}
 	case "none":
 		if len(s.Whitelist) == 0 {
-			warnf("未设置认证也未设置来源白名单，代理将对所有人开放，极易被滥用")
+			errf("无认证时必须设置来源 IP 白名单，否则代理会对所有人开放，极易被滥用")
 		}
 	case "per":
 	default:
 		errf("未知认证方式 %q", s.Auth.Mode)
-	}
-	for _, w := range s.Whitelist {
-		if _, err := netip.ParsePrefix(w); err != nil {
-			if _, err := netip.ParseAddr(w); err != nil {
-				errf("白名单条目无效: %s", w)
-			}
-		}
 	}
 	if len(res.Errors) > 0 {
 		return res
@@ -220,8 +229,8 @@ func Build(in Input) model.PlanResult {
 				}
 			}
 		}
-		// 同一 IP 的多个协议共用一组账号；沿用已部署的账号
-		if s.KeepExisting && (s.Auth.Mode == "per" || s.Auth.Mode == "shared") {
+		// 同一 IP 的多个协议共用一组账号；沿用已部署的账号（共享模式已在上面统一处理）
+		if s.KeepExisting && s.Auth.Mode == "per" {
 			for _, proto := range protos {
 				if old, ok := existing[key{a.IP, proto}]; ok && old.User != "" {
 					cred = model.Cred{User: old.User, Pass: old.Pass}
@@ -259,7 +268,7 @@ func Build(in Input) model.PlanResult {
 					port = rule.Port + i
 				case "random":
 					lo, hi := rule.RangeMin, rule.RangeMax
-					if lo < 1024 || hi > 65535 || lo >= hi {
+					if lo == 0 && hi == 0 {
 						lo, hi = 20000, 60000
 					}
 					for try := 0; try < 200; try++ {
@@ -304,6 +313,28 @@ func Build(in Input) model.PlanResult {
 			res.Proxies = append(res.Proxies, p)
 		}
 	}
+	// NAT：多个内网地址映射到同一公网地址时，相同端口的代理在客户端看来是同一个
+	pub := map[string][]string{}
+	for _, p := range res.Proxies {
+		if p.Public != "" && p.Public != p.Listen {
+			h := p.Public
+			if strings.Contains(h, ":") {
+				h = "[" + h + "]"
+			}
+			k := fmt.Sprintf("%s:%d", h, p.Port)
+			pub[k] = append(pub[k], p.Listen)
+		}
+	}
+	pubKeys := make([]string, 0, len(pub))
+	for k := range pub {
+		pubKeys = append(pubKeys, k)
+	}
+	sort.Strings(pubKeys)
+	for _, k := range pubKeys {
+		if l := pub[k]; len(l) > 1 {
+			warnf("%s 由 %d 个内网地址（%s）共用：它们映射到同一个公网 IP，客户端无法区分，出口也相同", k, len(l), strings.Join(l, "、"))
+		}
+	}
 	if len(res.Proxies) > 0 && s.Auth.Mode != "per" && s.Auth.Mode != "list" && hasLimits(s.Limits) && len(targets) > 1 {
 		warnf("限速、限连接和流量额度按账号生效：当前所有 IP 共用一个账号，限制会被所有 IP 共享。需要每个 IP 单独限制，请选择“每 IP 独立随机”")
 	}
@@ -338,6 +369,28 @@ func Validate(ps []model.Proxy, in Input) []string {
 		if p.Port == in.AdminPort && in.AdminPort != 0 {
 			errs = append(errs, fmt.Sprintf("端口 %d 保留给统计接口", p.Port))
 		}
+		// 以下字段会写入服务器上的 3proxy 配置与脚本，必须严格校验（防止注入）
+		if !isIP(p.Listen) {
+			errs = append(errs, fmt.Sprintf("监听地址 %q 无效", p.Listen))
+		}
+		if p.Public != "" && !isIP(p.Public) {
+			errs = append(errs, fmt.Sprintf("%s 的公网地址 %q 无效", p.Listen, p.Public))
+		}
+		if p.Iface != "" && !ifaceRe.MatchString(p.Iface) {
+			errs = append(errs, fmt.Sprintf("%s 的网卡名 %q 无效", p.Listen, p.Iface))
+		}
+		if p.Prefix < 0 || p.Prefix > 128 {
+			errs = append(errs, fmt.Sprintf("%s 的前缀长度 %d 无效", p.Listen, p.Prefix))
+		}
+		if p.ID != "" && !idRe.MatchString(p.ID) {
+			errs = append(errs, fmt.Sprintf("代理 ID %q 无效", p.ID))
+		}
+		for _, w := range p.Whitelist {
+			if !isIPOrPrefix(w) {
+				errs = append(errs, fmt.Sprintf("%s 的白名单条目 %q 无效", p.Listen, w))
+			}
+		}
+		errs = append(errs, validateLimits(p.Limits, fmt.Sprintf("%s:%d ", p.Listen, p.Port))...)
 		if p.User != "" || p.Pass != "" {
 			if !ValidCred(p.User, 1) || !ValidCred(p.Pass, 6) {
 				errs = append(errs, fmt.Sprintf("%s:%d 的账号不合法（字母、数字和 . _ -，密码至少 6 位）", p.Listen, p.Port))
@@ -352,6 +405,108 @@ func Validate(ps []model.Proxy, in Input) []string {
 		default:
 			errs = append(errs, fmt.Sprintf("未知协议 %q", p.Protocol))
 		}
+	}
+	return errs
+}
+
+var (
+	ifaceRe   = regexp.MustCompile(`^[A-Za-z0-9_.:@-]{1,15}$`)
+	idRe      = regexp.MustCompile(`^[a-z]+-[0-9A-Za-z_]+$`)
+	dateRe    = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	unitRe    = regexp.MustCompile(`^[A-Za-z0-9@._-]{1,64}$`)
+	mirrorRe  = regexp.MustCompile(`^https://[A-Za-z0-9.-]+(:\d{1,5})?(/[A-Za-z0-9._~%+=/-]*)?$`)
+	dnsPortRe = regexp.MustCompile(`^\d{1,5}$`)
+)
+
+func isIP(s string) bool {
+	a, err := netip.ParseAddr(s)
+	return err == nil && a.Zone() == ""
+}
+
+func isIPOrPrefix(s string) bool {
+	if isIP(s) {
+		return true
+	}
+	_, err := netip.ParsePrefix(s)
+	return err == nil
+}
+
+// validDNSServer 接受 IP、IP:端口、[IPv6]:端口
+func validDNSServer(s string) bool {
+	if isIP(s) {
+		return true
+	}
+	h, p, err := net.SplitHostPort(s)
+	return err == nil && isIP(h) && dnsPortRe.MatchString(p)
+}
+
+func validateLimits(l model.Limits, prefix string) []string {
+	var errs []string
+	if l.SpeedMbps < 0 || l.MaxConn < 0 || l.QuotaGB < 0 {
+		errs = append(errs, prefix+"限速、并发和流量额度不能为负数")
+	}
+	switch l.QuotaPeriod {
+	case "", "D", "W", "M":
+	default:
+		errs = append(errs, fmt.Sprintf("%s流量周期 %q 无效（D/W/M）", prefix, l.QuotaPeriod))
+	}
+	if l.ExpiresAt != "" {
+		if _, err := time.Parse("2006-01-02", l.ExpiresAt); err != nil || !dateRe.MatchString(l.ExpiresAt) {
+			errs = append(errs, fmt.Sprintf("%s到期日期 %q 格式应为 YYYY-MM-DD", prefix, l.ExpiresAt))
+		}
+	}
+	return errs
+}
+
+// ValidateSettings 校验会写进服务器配置的设置项。预览、部署（含手动编辑过的清单）都会调用。
+func ValidateSettings(s model.Settings) []string {
+	var errs []string
+	for _, w := range s.Whitelist {
+		if !isIPOrPrefix(w) {
+			errs = append(errs, fmt.Sprintf("白名单条目无效: %s", w))
+		}
+	}
+	switch s.DNS.Mode {
+	case "recursive", "system", "":
+	case "forward", "public", "custom":
+		for _, d := range s.DNS.Servers {
+			if !validDNSServer(d) {
+				errs = append(errs, fmt.Sprintf("DNS 服务器 %q 无效（应为 IP 或 IP:端口）", d))
+			}
+		}
+	default:
+		errs = append(errs, fmt.Sprintf("未知 DNS 模式 %q", s.DNS.Mode))
+	}
+	for _, r := range []struct {
+		name string
+		rule model.PortRule
+	}{{"SOCKS5", s.Socks}, {"HTTP", s.HTTP}} {
+		if r.rule.Mode == "random" && !(r.rule.RangeMin == 0 && r.rule.RangeMax == 0) {
+			if r.rule.RangeMin < 1 || r.rule.RangeMax > 65535 || r.rule.RangeMin >= r.rule.RangeMax {
+				errs = append(errs, fmt.Sprintf("%s 随机端口范围 %d-%d 无效", r.name, r.rule.RangeMin, r.rule.RangeMax))
+			}
+		}
+	}
+	if s.Auth.PassLen != 0 && (s.Auth.PassLen < 8 || s.Auth.PassLen > 64) {
+		errs = append(errs, fmt.Sprintf("随机密码长度 %d 无效（8-64）", s.Auth.PassLen))
+	}
+	if s.Auth.UserLen != 0 && (s.Auth.UserLen < 4 || s.Auth.UserLen > 32) {
+		errs = append(errs, fmt.Sprintf("随机用户名长度 %d 无效（4-32）", s.Auth.UserLen))
+	}
+	if s.Auth.UserPrefix != "" && (!ValidCred(s.Auth.UserPrefix, 1) || len(s.Auth.UserPrefix) > 16) {
+		errs = append(errs, "用户名前缀只能包含字母、数字和 . _ -，最多 16 位")
+	}
+	if s.MaxConn < 0 {
+		errs = append(errs, "每服务最大并发不能为负数")
+	}
+	errs = append(errs, validateLimits(s.Limits, "")...)
+	for _, u := range s.StopConflicts {
+		if !unitRe.MatchString(u) {
+			errs = append(errs, fmt.Sprintf("服务名 %q 无效", u))
+		}
+	}
+	if s.GitHubMirror != "" && !mirrorRe.MatchString(s.GitHubMirror) {
+		errs = append(errs, "GitHub 镜像必须是 https:// 开头的地址")
 	}
 	return errs
 }

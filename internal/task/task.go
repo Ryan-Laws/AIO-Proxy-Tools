@@ -162,6 +162,11 @@ func (m *Manager) Start(serverID, kind string, fn func(ctx context.Context, t *T
 			}()
 			err = fn(ctx, t)
 		}()
+		// 先执行 onEnd（释放服务器占用），再把任务标记为结束：
+		// 否则调用方看到任务结束后立刻提交下一个任务，可能被误判为"服务器忙"
+		if onEnd != nil {
+			onEnd(t, err)
+		}
 		t.mu.Lock()
 		t.v.EndedAt = time.Now()
 		switch {
@@ -180,9 +185,6 @@ func (m *Manager) Start(serverID, kind string, fn func(ctx context.Context, t *T
 		}
 		t.publish()
 		cancel()
-		if onEnd != nil {
-			onEnd(t, err)
-		}
 	}()
 	return t
 }

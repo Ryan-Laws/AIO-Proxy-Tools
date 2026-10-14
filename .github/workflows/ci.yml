@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -25,6 +26,7 @@ jobs:
         run: cd web && npm ci && npm run build
       - name: go vet / test
         run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "以上文件需要 gofmt"; exit 1; }
           go vet ./...
           go test -race ./...
       - name: shellcheck
@@ -34,15 +36,62 @@ jobs:
           for f in install uninstall ctl; do { echo '#!/bin/sh'; cat scripts/common.sh scripts/$f.sh; } > $d/$f.sh; done
           cp scripts/detect.sh scripts/probe.sh $d/
           shellcheck -s sh -S warning -e SC2086,SC1091 $d/*.sh
+          shellcheck -S warning test/e2e/*.sh build.sh
+      - name: 发布打包演练（与 release.yml 相同的 build.sh）
+        run: |
+          ./build.sh v0.0.0-ci
+          ls -l dist
+          (cd dist && sha256sum -c SHA256SUMS)
+          tar -xzf dist/aio-proxy-tools-v0.0.0-ci-linux-amd64.tar.gz -C /tmp
+          /tmp/aio-proxy-tools-v0.0.0-ci-linux-amd64/aio-proxy-tools -version | grep -q 'v0.0.0-ci'
+          ls /tmp/aio-proxy-tools-v0.0.0-ci-linux-amd64/README.zh-CN.md
+
+  cross:
+    # Windows / macOS 上的单元测试与界面启动冒烟
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: 构建
+        shell: bash
+        run: |
+          cd web && npm ci && npm run build && cd ..
+          go build -o aio-bin ./cmd/aio-proxy-tools
+      - name: 单元测试
+        run: go test ./...
+      - name: 启动界面冒烟
+        shell: bash
+        run: |
+          ./aio-bin -no-browser -listen 127.0.0.1:17999 -data "$RUNNER_TEMP/aio" > out.txt 2>&1 &
+          for i in $(seq 30); do grep -q 't=' out.txt && break; sleep 1; done
+          cat out.txt
+          url=$(grep -o 'http://127.0.0.1:17999/?t=[0-9a-f]*' out.txt)
+          curl -fsS "$url" | grep -q 'id="root"'
+          tok=${url##*t=}
+          # 没有令牌、或 Host 头不对时必须拒绝
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:17999/api/servers)
+          [ "$code" = 401 ] || [ "$code" = 403 ] || { echo "无令牌访问 API 返回 $code"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' "http://127.0.0.1:17999/?t=$tok")
+          [ "$code" != 200 ] || { echo "错误的 Host 头也能访问"; exit 1; }
 
   e2e:
     # 在真实 Linux（systemd）上通过 SSH 完整跑一遍：探测 → 部署 → 测试 → 重新部署 → 卸载
-    runs-on: ubuntu-24.04
     needs: test
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
         login: [root-password, sudo-key]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -57,11 +106,46 @@ jobs:
           go build -o aio ./cmd/aio-proxy-tools
       - name: 准备 SSH 与测试 IP
         run: sh test/e2e/prepare.sh ${{ matrix.login }}
-      - name: 端到端测试
+      - name: 端到端测试（命令行）
         run: bash test/e2e/run.sh ${{ matrix.login }}
+      - name: 端到端测试（界面使用的 HTTP API）
+        run: bash test/e2e/api.sh ${{ matrix.login }}
       - name: 失败时收集日志
         if: failure()
         run: |
           sudo journalctl -u aio-proxy -u aio-proxy-dns --no-pager -n 200 || true
           sudo ls -la /etc/aio-proxy /opt/aio-proxy || true
           sudo cat /etc/aio-proxy/3proxy.cfg || true
+
+  distro:
+    # 各发行版（容器内运行 systemd / OpenRC）：逐项验证代理功能、重启恢复、防火墙、卸载
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "debian:12", login: root-key, fw: ufw }
+          - { image: "debian:11", login: sudo-pass, fw: none }
+          - { image: "ubuntu:22.04", login: root-key, fw: none }
+          - { image: "rockylinux/rockylinux:9", login: sudo-pass, fw: firewalld }
+          - { image: "almalinux:8", login: root-key, fw: none }
+          - { image: "fedora:41", login: root-key, fw: none }
+          - { image: "opensuse/leap:15.6", login: root-key, fw: none }
+          - { image: "archlinux:latest", login: root-key, fw: none }
+          - { image: "alpine:3.20", login: sudo-pass, fw: none }
+    name: distro (${{ matrix.image }}, ${{ matrix.login }}, ${{ matrix.fw }})
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: 构建
+        run: |
+          cd web && npm ci && npm run build && cd ..
+          go build -o aio ./cmd/aio-proxy-tools
+      - name: 端到端测试
+        run: bash test/e2e/distro.sh "${{ matrix.image }}" "${{ matrix.login }}" "${{ matrix.fw }}"

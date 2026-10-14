@@ -116,7 +116,17 @@ func Dial(ctx context.Context, cfg Config, kh *KnownHosts) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("无法连接 %s: %v", addr, friendlyNetErr(err))
 	}
+	// ClientConfig.Timeout 只对 ssh.Dial 生效：这里自己给握手设截止时间，并响应取消，
+	// 否则遇到"TCP 能连上但不发 SSH 标识"的端口会永远卡住
+	raw.SetDeadline(time.Now().Add(cfg.Timeout))
+	stop := context.AfterFunc(ctx, func() { raw.Close() })
 	sconn, chans, reqs, err := ssh.NewClientConn(raw, addr, sc)
+	stop()
+	raw.SetDeadline(time.Time{})
+	if err == nil && ctx.Err() != nil {
+		sconn.Close()
+		err = ctx.Err()
+	}
 	if err != nil {
 		raw.Close()
 		var hke *HostKeyError
@@ -147,7 +157,7 @@ func Dial(ctx context.Context, cfg Config, kh *KnownHosts) (*Client, error) {
 				return nil, errors.New("当前用户不是 root，且 sudo 需要密码：请改用 root 登录，或填写该用户的密码")
 			}
 			c.sudoNeedPwd = true
-			_, code, _ := c.Output(ctx, "sudo -S -p '' true", strings.NewReader(cfg.Password+"\n"))
+			_, code, _ := c.Output(ctx, "sudo -k -S -p '' true", strings.NewReader(cfg.Password+"\n"))
 			if code != 0 {
 				c.Close()
 				return nil, errors.New("当前用户不是 root，且无法使用 sudo 提权")
@@ -161,9 +171,26 @@ func keepalive(c *ssh.Client) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	for range t.C {
-		if _, _, err := c.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+		if ping(c) != nil {
 			return
 		}
+	}
+}
+
+// ping 发送保活请求，15 秒没有回应就关闭连接：连接"半死"（网络切换、NAT 超时）时
+// SendRequest 会一直阻塞到 TCP 重传放弃（Linux 上约 15 分钟）
+func ping(c *ssh.Client) error {
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(15 * time.Second):
+		c.Close()
+		return errors.New("SSH 连接无响应")
 	}
 }
 
@@ -192,8 +219,7 @@ func (c *Client) Alive() bool {
 	if c.conn == nil {
 		return false
 	}
-	_, _, err := c.conn.SendRequest("keepalive@openssh.com", true, nil)
-	return err == nil
+	return ping(c.conn) == nil
 }
 
 func (c *Client) IsRoot() bool { return c.isRoot }
@@ -341,7 +367,7 @@ func (c *Client) asRoot(cmd string) string {
 		return cmd
 	}
 	if c.sudoNeedPwd {
-		return "sudo -S -p '' " + cmd
+		return "sudo -k -S -p '' " + cmd
 	}
 	return "sudo -n " + cmd
 }

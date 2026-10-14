@@ -76,11 +76,18 @@ func TestVia(ctx context.Context, p model.Proxy, viaListen bool) model.TestResul
 	}
 	if p.User != "" {
 		_, err := fetch(ctx, p.Protocol, addr, nil, urls[0])
-		denied := err != nil
-		r.AuthOK = &denied
-		if !denied {
+		var ae authErr
+		switch {
+		case err == nil:
+			denied := false
+			r.AuthOK = &denied
 			r.Error = "不带密码也能使用，认证未生效！"
 			r.OK = false
+		case errors.As(err, &ae):
+			denied := true
+			r.AuthOK = &denied
+		default:
+			// 超时、回显服务不可用等：无法判断认证是否生效，不下结论（AuthOK 留空）
 		}
 	}
 	return r
@@ -156,7 +163,8 @@ func fetch(ctx context.Context, proto, addr string, cred *url.Userinfo, target s
 	if err != nil {
 		s := err.Error()
 		if strings.Contains(s, "407") || strings.Contains(s, "Proxy Authentication Required") ||
-			strings.Contains(s, "authentication failed") || strings.Contains(s, "not allowed by ruleset") {
+			strings.Contains(s, "authentication failed") || strings.Contains(s, "not allowed by ruleset") ||
+			strings.Contains(s, "no acceptable authentication methods") {
 			return "", authErr{"认证被拒绝"}
 		}
 		return "", err

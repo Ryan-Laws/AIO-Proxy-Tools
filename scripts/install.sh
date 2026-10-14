@@ -17,10 +17,13 @@ cd "$W" || die "工作目录不可用"
 # =============================================================== 依赖
 step "检查依赖"
 need=""
-has curl || has wget || need="$need curl"
+# curl 是必需的：服务器自检、递归 DNS 失败检测都依赖它（busybox wget 不支持代理和绑定地址）
+has curl || need="$need curl"
 has tar || need="$need tar"
-has ip || case "$PM" in apk|pacman) need="$need iproute2" ;; apt-get) need="$need iproute2" ;; *) need="$need iproute" ;; esac
-has ss || has netstat || case "$PM" in apt-get|apk|pacman) need="$need iproute2" ;; *) need="$need iproute" ;; esac
+case "$PM" in dnf|yum) iproute=iproute ;; *) iproute=iproute2 ;; esac
+has ip || need="$need $iproute"
+has ss || has netstat || need="$need $iproute"
+has pgrep || case "$PM" in apk) ;; apt-get) need="$need procps" ;; zypper) need="$need procps" ;; *) need="$need procps-ng" ;; esac
 [ -d /etc/ssl/certs ] || need="$need ca-certificates"
 if [ -n "$need" ]; then
   info "安装:$need"
@@ -38,10 +41,11 @@ get_asset() {
   fetch "${MIRROR}$REL/$1" "$2"
 }
 
-# 校验：$1=文件 $2=文件名 $3=校验和文件
+# 校验：$1=文件 $2=文件名。校验值来自客户端随附的 pinned.sums（写死在程序里），
+# 不使用下载来的 SHA256SUMS：它与安装包同一来源，镜像或中间人可以一起替换
 verify() {
-  want=$(awk -v n="$2" '{f=$2; sub(/^\*/,"",f)} f==n {print $1}' "$3")
-  [ -n "$want" ] || { warn "校验文件中找不到 $2"; return 1; }
+  want=$(awk -v n="$2" '$2==n {print $1}' "$W/pinned.sums")
+  [ -n "$want" ] || { warn "没有 $2 的内置校验值"; return 1; }
   got=$(sha256_of "$1")
   [ "$want" = "$got" ] || { warn "$2 SHA256 不匹配"; return 1; }
 }
@@ -55,11 +59,12 @@ binary_ok() {
 }
 
 install_from_pkg() {
-  pkg=""; sums=""
+  pkg=""
   case "$ARCH" in
-    x86_64|amd64) sums=SHA256SUMS-x86_64; deb="3proxy-$TP_VERSION.x86_64.deb"; rarch=x86_64 ;;
-    aarch64|arm64) sums=SHA256SUMS-arm64; deb="3proxy-$TP_VERSION.arm64.deb"; rarch=aarch64 ;;
-    armv7*|armv6*|armhf) sums=SHA256SUMS-arm; deb="3proxy-$TP_VERSION.arm.deb"; rarch="" ;;
+    x86_64|amd64) deb="3proxy-$TP_VERSION.x86_64.deb"; rarch=x86_64 ;;
+    aarch64|arm64) deb="3proxy-$TP_VERSION.arm64.deb"; rarch=aarch64 ;;
+    # 官方 arm 包按 ARMv7 编译，ARMv6（树莓派 Zero 等）上会非法指令，只能从源码编译
+    armv7*|armhf) deb="3proxy-$TP_VERSION.arm.deb"; rarch="" ;;
     *) return 1 ;;
   esac
   major=${OS_VER%%.*}
@@ -75,9 +80,8 @@ install_from_pkg() {
   fi
   info "尝试官方安装包 $pkg"
   T=$W/pkg; rm -rf "$T"; mkdir -p "$T/x"
-  get_asset "$sums" "$T/sums" || { echo "::need::pkg $pkg $sums"; return 1; }
-  get_asset "$pkg" "$T/$pkg" || { echo "::need::pkg $pkg $sums"; return 1; }
-  verify "$T/$pkg" "$pkg" "$T/sums" || return 1
+  get_asset "$pkg" "$T/$pkg" || { echo "::need::pkg $pkg"; return 1; }
+  verify "$T/$pkg" "$pkg" || return 1
   case "$pkg" in
     *.deb) dpkg-deb -x "$T/$pkg" "$T/x" 2>/dev/null || { warn "dpkg-deb 无法解包（系统 dpkg 不支持 zstd）"; return 1; } ;;
     *.rpm) has cpio || pkg_install cpio; (cd "$T/x" && rpm2cpio "$T/$pkg" | cpio -idm --quiet 2>/dev/null) || return 1 ;;
@@ -91,9 +95,8 @@ install_from_src() {
   src="3proxy-$TP_VERSION.tar.gz"
   info "从官方源码编译（约 1 分钟）"
   T=$W/src; rm -rf "$T"; mkdir -p "$T"
-  get_asset SHA256SUMS-src "$T/sums" || { echo "::need::src $src SHA256SUMS-src"; return 1; }
-  get_asset "$src" "$T/$src" || { echo "::need::src $src SHA256SUMS-src"; return 1; }
-  verify "$T/$src" "$src" "$T/sums" || return 1
+  get_asset "$src" "$T/$src" || { echo "::need::src $src"; return 1; }
+  verify "$T/$src" "$src" || return 1
   if ! has gcc || ! has make; then
     info "安装编译工具"
     case "$PM" in
@@ -110,7 +113,8 @@ install_from_src() {
   jobs=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
   if ! (cd "$d" && make -f Makefile.Linux -j"$jobs" >"$T/build.log" 2>&1); then
     # 部分老编译器不支持 LTO，去掉后重试
-    (cd "$d" && make -f Makefile.Linux clean >/dev/null 2>&1; make -f Makefile.Linux CFLAGS=-O2 LDFLAGS=-O2 -j"$jobs" >"$T/build.log" 2>&1) \
+    # 用环境变量而不是命令行赋值：Makefile 里是 CFLAGS ?= ... 再 +=，命令行赋值会连 += 的部分一起覆盖
+    (cd "$d" && make -f Makefile.Linux clean >/dev/null 2>&1; CFLAGS=-O2 LDFLAGS=-O2 make -f Makefile.Linux -j"$jobs" >"$T/build.log" 2>&1) \
       || { tail -n 20 "$T/build.log"; return 1; }
   fi
   binary_ok "$d/bin/3proxy" || return 1
@@ -119,10 +123,12 @@ install_from_src() {
 
 step "安装 3proxy $TP_VERSION"
 mkdir -p "$OPT/bin" "$ETC" "$VAR"
+BIN_CHANGED=0
 if binary_ok "$BIN" && [ "$(cat "$OPT/3proxy.version" 2>/dev/null)" = "$TP_VERSION" ]; then
   ok "3proxy $TP_VERSION 已安装"
 else
   if install_from_pkg || install_from_src; then
+    BIN_CHANGED=1
     echo "$TP_VERSION" > "$OPT/3proxy.version"
     ok "3proxy $TP_VERSION 安装完成"
   else
@@ -132,15 +138,24 @@ else
 fi
 
 # =============================================================== 用户与目录
+# 专用同名组：Alpine 的 adduser -S 默认把主组设为 nogroup，openSUSE 可能设为 users，
+# 那样账号文件（root:组 0640）会被同组的其它账号读到
+group_exists() { grep -q "^$1:" /etc/group 2>/dev/null; }
+if ! group_exists "$RUN_USER"; then
+  if has groupadd; then groupadd -r "$RUN_USER" 2>/dev/null; elif has addgroup; then addgroup -S "$RUN_USER" 2>/dev/null; fi
+fi
 if ! id "$RUN_USER" >/dev/null 2>&1; then
-  if has useradd; then useradd -r -M -d "$VAR" -s /sbin/nologin "$RUN_USER" 2>/dev/null || useradd -r -M -s /bin/false "$RUN_USER"
-  elif has adduser; then adduser -S -D -H -h "$VAR" -s /sbin/nologin "$RUN_USER" 2>/dev/null; addgroup -S "$RUN_USER" 2>/dev/null; addgroup "$RUN_USER" "$RUN_USER" 2>/dev/null
+  if has useradd; then useradd -r -M -d "$VAR" -s /sbin/nologin -g "$RUN_USER" "$RUN_USER" 2>/dev/null || useradd -r -M -s /bin/false -g "$RUN_USER" "$RUN_USER"
+  elif has adduser; then adduser -S -D -H -h "$VAR" -s /sbin/nologin -G "$RUN_USER" "$RUN_USER" 2>/dev/null
   fi
 fi
 id "$RUN_USER" >/dev/null 2>&1 || die "无法创建运行用户 $RUN_USER"
-RUN_GROUP=$(id -gn "$RUN_USER")
+if group_exists "$RUN_USER"; then RUN_GROUP=$RUN_USER; else RUN_GROUP=$(id -gn "$RUN_USER"); fi
+mkdir -p "$VAR"
+# $VAR 归运行用户所有，里面的东西可能被替换成符号链接：不跟随链接，避免 root 的 chown 被引到别处
+[ -L "$VAR/logs" ] && rm -f "$VAR/logs"
 mkdir -p "$VAR/logs"
-chown "$RUN_USER:$RUN_GROUP" "$VAR" "$VAR/logs"; chmod 0750 "$VAR"
+chown -h "$RUN_USER:$RUN_GROUP" "$VAR" "$VAR/logs"; chmod 0750 "$VAR"
 
 # =============================================================== 冲突服务
 for s in $STOP_CONFLICTS; do
@@ -154,7 +169,7 @@ done
 # =============================================================== 端口冲突检查
 step "检查端口占用"
 listening_sockets > "$W/inuse.txt"
-conflicts=$(awk 'NR==FNR { u[$1" "$2]=1; if($1=="0.0.0.0"||$1=="*"||$1=="::") w[$2]=1; next }
+conflicts=$(awk 'FILENAME == ARGV[1] { u[$1" "$2]=1; if($1=="0.0.0.0"||$1=="*"||$1=="::") w[$2]=1; next }
                  { if (($1" "$2) in u || $2 in w) print $1":"$2 }' "$W/inuse.txt" "$W/listen.txt" | head -n 20)
 if [ -n "$conflicts" ]; then
   echo "$conflicts" | while read -r c; do warn "端口已被其它程序占用: $c"; done
@@ -174,20 +189,23 @@ done < /etc/aio-proxy/bind.txt
 exit 0
 EOF
 chmod 0755 "$OPT/bind-ip.sh"
+# 上次绑定但这次不再需要的地址：先记下来，等新配置验证成功后再解绑（失败回滚时旧配置还要用）
+: > "$W/unbind.txt"
+if [ -s "$ETC/bind.txt" ]; then
+  [ -f "$ETC/bind.txt.bak" ] || cp -p "$ETC/bind.txt" "$ETC/bind.txt.bak"
+  if [ -s "$W/bind.txt" ]; then
+    awk 'FILENAME == ARGV[1] {k[$1]=1; next} !($1 in k)' "$W/bind.txt" "$ETC/bind.txt" > "$W/unbind.txt"
+  else
+    cp "$ETC/bind.txt" "$W/unbind.txt"
+  fi
+fi
 if [ -s "$W/bind.txt" ]; then
   step "绑定额外 IP 到网卡"
-  # 撤销上次绑定但这次不再需要的地址
-  if [ -s "$ETC/bind.txt" ]; then
-    awk 'NR==FNR{k[$1]=1; next} !($1 in k)' "$W/bind.txt" "$ETC/bind.txt" | while read -r cidr dev; do ip addr del "$cidr" dev "$dev" 2>/dev/null; done
-  fi
   install -m 0644 "$W/bind.txt" "$ETC/bind.txt"
   "$OPT/bind-ip.sh"
   ok "已绑定 $(wc -l < "$W/bind.txt" | tr -d ' ') 个地址（重启后自动恢复）"
 else
-  if [ -s "$ETC/bind.txt" ]; then
-    while read -r cidr dev; do ip addr del "$cidr" dev "$dev" 2>/dev/null; done < "$ETC/bind.txt"
-    rm -f "$ETC/bind.txt"
-  fi
+  rm -f "$ETC/bind.txt"
 fi
 
 # =============================================================== DNS
@@ -269,7 +287,7 @@ esac
 
 # =============================================================== 配置文件
 step "写入配置"
-for f in 3proxy.cfg users.list proxies.json; do [ -f "$ETC/$f" ] && cp -p "$ETC/$f" "$ETC/$f.bak"; done
+for f in 3proxy.cfg users.list expiry.list proxies.json; do [ -f "$ETC/$f" ] && cp -p "$ETC/$f" "$ETC/$f.bak"; done
 install -m 0640 -o root -g "$RUN_GROUP" "$W/3proxy.cfg" "$ETC/3proxy.cfg"
 install -m 0640 -o root -g "$RUN_GROUP" "$W/users.list" "$ETC/users.list"
 install -m 0640 -o root -g "$RUN_GROUP" "$W/expiry.list" "$ETC/expiry.list"
@@ -281,6 +299,7 @@ cat > "$OPT/expire.sh" <<'EOF'
 #!/bin/sh
 # 根据 /etc/aio-proxy/expiry.list 过滤到期账号，变化时让 3proxy 重新加载
 E=/etc/aio-proxy
+umask 027   # 临时文件含明文密码：从创建起就不让其它用户读
 today=$(date +%Y-%m-%d)
 tmp=$E/users.active.tmp
 # 用 FILENAME 而不是 NR==FNR 区分文件：expiry.list 为空时 NR==FNR 对 users.list 也成立，会吞掉全部账号
@@ -321,6 +340,16 @@ EOF
 elif [ -d /etc/periodic/hourly ]; then
   printf '#!/bin/sh\n%s --reload\n' "$OPT/expire.sh" > /etc/periodic/hourly/$SVC-expire
   chmod 0755 /etc/periodic/hourly/$SVC-expire
+  # /etc/periodic 由 crond 执行：不少镜像默认没启用 crond
+  if [ $INIT = openrc ] && [ -x /etc/init.d/crond ]; then
+    svc_enabled crond || { rc-update add crond default >/dev/null 2>&1 && echo crond >> "$ETC/enabled-services"; }
+    svc_active crond || rc-service crond start >/dev/null 2>&1
+  fi
+else
+  # 没有定时机制：写入 root 的 crontab
+  if has crontab; then
+    (crontab -l 2>/dev/null | grep -v '/opt/aio-proxy/expire.sh'; echo "17 * * * * $OPT/expire.sh --reload") | crontab - 2>/dev/null
+  fi
 fi
 
 # =============================================================== 内核参数
@@ -331,11 +360,13 @@ if [ "$TUNE" = 1 ] || [ "$BBR" = 1 ]; then
     if [ "$TUNE" = 1 ]; then
       echo "net.core.somaxconn = 4096"
       echo "net.ipv4.tcp_max_syn_backlog = 4096"
-      echo "net.ipv4.ip_local_port_range = 10240 65535"
+      # 不改 ip_local_port_range：扩大到 1 万以上会和代理监听端口重叠
       echo "net.ipv4.tcp_tw_reuse = 1"
       echo "net.ipv4.tcp_fin_timeout = 30"
       echo "net.ipv4.tcp_keepalive_time = 600"
-      echo "fs.file-max = 1048576"
+      # 只在当前值更小时调高（新内核默认值通常大得多，不能调低）
+      fm=$(cat /proc/sys/fs/file-max 2>/dev/null || echo 0)
+      [ "${#fm}" -lt 7 ] && [ "$fm" -lt 1048576 ] && echo "fs.file-max = 1048576"
     fi
     if [ "$BBR" = 1 ]; then
       modprobe tcp_bbr 2>/dev/null
@@ -369,8 +400,14 @@ Group=$RUN_GROUP
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
+# 沙箱：系统目录只读，只有数据目录可写（以 + 开头的 ExecStartPre 以 root 运行，不受限制）
+ProtectSystem=strict
+ReadWritePaths=$VAR
+ProtectHome=yes
+PrivateTmp=yes
 ExecStartPre=+$OPT/bind-ip.sh
 ExecStartPre=+$OPT/expire.sh
+ExecStartPre=-+$OPT/fw-apply.sh
 ExecStart=$BIN $ETC/3proxy.cfg
 ExecReload=/bin/kill -USR1 \$MAINPID
 KillMode=process
@@ -391,13 +428,15 @@ EOF
 description="AIO Proxy Tools (3proxy)"
 command="$BIN"
 command_args="$ETC/3proxy.cfg"
+command_user="$RUN_USER:$RUN_GROUP"
+capabilities="^cap_net_bind_service"
 supervisor=supervise-daemon
 respawn_delay=3
 pidfile=/run/$SVC.pid
 rc_ulimit="-n 1048576"
 extra_started_commands="reload"
 depend() { need net; after $DNS_SVC; }
-start_pre() { $OPT/bind-ip.sh; $OPT/expire.sh; }
+start_pre() { $OPT/bind-ip.sh; $OPT/expire.sh; [ -x $OPT/fw-apply.sh ] && $OPT/fw-apply.sh; return 0; }
 reload() { ebegin "Reloading \$RC_SVCNAME"; pkill -USR1 -f "^$BIN " ; eend \$?; }
 EOF
     chmod 0755 /etc/init.d/$SVC ;;
@@ -407,13 +446,16 @@ svc_enable "$SVC"
 
 all_listening() {
   listening_sockets >/dev/null  # 预热
-  if has ss; then ss -ltnH 2>/dev/null | awk '{print $4}'; else netstat -ltn 2>/dev/null | awk 'NR>2{print $4}'; fi \
+  if has ss; then ss -ltn 2>/dev/null | awk 'NR>1{print $4}'; else netstat -ltn 2>/dev/null | awk 'NR>2{print $4}'; fi \
     | sed -E 's/^\[?(.*)\]?:([0-9]+)$/\1 \2/; s/\]//; s/%[^ ]*//' > "$W/now.txt"
-  missing=$(awk 'NR==FNR{u[$1" "$2]=1; next} !(($1" "$2) in u)' "$W/now.txt" "$W/listen.txt" | wc -l)
+  missing=$(awk 'FILENAME == ARGV[1] {u[$1" "$2]=1; next} !(($1" "$2) in u)' "$W/now.txt" "$W/listen.txt" | wc -l)
   [ "$missing" -eq 0 ]
 }
 
-if svc_active "$SVC"; then
+if svc_active "$SVC" && [ "$BIN_CHANGED" = 1 ]; then
+  step "重启 3proxy（程序已更新）"
+  svc_restart "$SVC"
+elif svc_active "$SVC"; then
   step "重新加载 3proxy（不断开现有连接）"
   case $INIT in systemd) systemctl reload $SVC ;; openrc) rc-service $SVC reload >/dev/null ;; esac
 else
@@ -428,28 +470,86 @@ if ! all_listening; then
   svc_restart "$SVC"; sleep 3
 fi
 if ! svc_active "$SVC" || ! all_listening; then
-  n=$(awk 'NR==FNR{u[$1" "$2]=1; next} !(($1" "$2) in u)' "$W/now.txt" "$W/listen.txt" | head -n 5)
+  n=$(awk 'FILENAME == ARGV[1] {u[$1" "$2]=1; next} !(($1" "$2) in u)' "$W/now.txt" "$W/listen.txt" | head -n 5)
   [ -n "$n" ] && echo "$n" | while read -r a p; do warn "未监听: $a:$p"; done
   if [ $INIT = systemd ]; then journalctl -u $SVC -n 15 --no-pager 2>/dev/null; fi
   if [ -f "$ETC/3proxy.cfg.bak" ]; then
     warn "回滚到上一次的配置"
-    for f in 3proxy.cfg users.list proxies.json; do [ -f "$ETC/$f.bak" ] && mv -f "$ETC/$f.bak" "$ETC/$f"; done
-    "$OPT/expire.sh"; svc_restart "$SVC"
+    for f in 3proxy.cfg users.list expiry.list proxies.json bind.txt; do [ -f "$ETC/$f.bak" ] && mv -f "$ETC/$f.bak" "$ETC/$f"; done
+    "$OPT/bind-ip.sh"; "$OPT/expire.sh"; svc_restart "$SVC"
+  else
+    # 首次安装就失败：停用服务，避免 Restart=always 无限重启
+    svc_stop "$SVC"; svc_disable "$SVC"
   fi
   die "3proxy 启动失败"
 fi
 ok "3proxy 运行中，$(wc -l < "$W/listen.txt" | tr -d ' ') 个监听全部就绪"
+# 新配置已生效，解绑不再需要的旧地址
+if [ -s "$W/unbind.txt" ]; then
+  while read -r cidr dev; do ip addr del "$cidr" dev "$dev" 2>/dev/null; done < "$W/unbind.txt"
+fi
 
 # =============================================================== 防火墙
 fw_state=$ETC/fw.state
+# fw.state 每行 "类型 协议 端口"，只记录本工具新增的规则（用户原有的同样规则不记，卸载时不会误删）
+cat > "$OPT/fw-undo.sh" <<'EOF'
+#!/bin/sh
+# 撤销本工具添加的防火墙规则；撤销失败的条目留在 fw.state 里，下次再试
+S=/etc/aio-proxy/fw.state
+[ -s "$S" ] || exit 0
+reload_fwd=0
+: > "$S.left"
+while read -r kind proto ports; do
+  r=0
+  case $kind in
+    ufw) ufw delete allow "$ports/$proto" >/dev/null 2>&1 || r=1 ;;
+    firewalld)
+      if firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --remove-port="$ports/$proto" >/dev/null 2>&1 || r=1; reload_fwd=1
+      else
+        firewall-offline-cmd --remove-port="$ports/$proto" >/dev/null 2>&1 || r=1
+      fi ;;
+    iptables|ip6tables)
+      while $kind -D INPUT -p "$proto" --dport "$ports" -m comment --comment aio-proxy -j ACCEPT 2>/dev/null; do :; done ;;
+    nft)
+      for h in $(nft -a list chain inet filter input 2>/dev/null | grep 'comment "aio-proxy"' | grep "$proto dport $ports " | sed -n 's/.*# handle //p'); do
+        nft delete rule inet filter input handle "$h" 2>/dev/null
+      done ;;
+  esac
+  [ $r = 0 ] || echo "$kind $proto $ports" >> "$S.left"
+done < "$S"
+[ $reload_fwd = 1 ] && firewall-cmd --reload >/dev/null 2>&1
+mv -f "$S.left" "$S"
+exit 0
+EOF
+cat > "$OPT/fw-apply.sh" <<'EOF'
+#!/bin/sh
+# 服务启动前补齐本工具的 iptables / nftables 规则：这两类规则重启后会丢失，
+# 这样既不用改动用户的防火墙持久化文件，卸载后也不会留下残留
+S=/etc/aio-proxy/fw.state
+[ -s "$S" ] || exit 0
+while read -r kind proto ports; do
+  case $kind in
+    iptables|ip6tables)
+      $kind -C INPUT -p "$proto" --dport "$ports" -m comment --comment aio-proxy -j ACCEPT 2>/dev/null \
+        || $kind -I INPUT -p "$proto" --dport "$ports" -m comment --comment aio-proxy -j ACCEPT 2>/dev/null ;;
+    nft)
+      nft list chain inet filter input 2>/dev/null | grep 'comment "aio-proxy"' | grep -q "$proto dport $ports " \
+        || nft insert rule inet filter input "$proto" dport "$ports" accept comment \"aio-proxy\" 2>/dev/null ;;
+  esac
+done < "$S"
+exit 0
+EOF
+chmod 0755 "$OPT/fw-undo.sh" "$OPT/fw-apply.sh"
+
 if [ "$FW" = 1 ] && [ -s "$W/fw.txt" ]; then
   step "放行防火墙端口"
-  # 先撤销上一次添加的规则
-  if [ -s "$fw_state" ]; then sh "$OPT/fw-undo.sh" 2>/dev/null; fi
-  : > "$fw_state"
+  # 先撤销上一次添加的规则（失败的条目会保留，与新规则一起记录）
+  if [ -s "$fw_state" ]; then "$OPT/fw-undo.sh"; else : > "$fw_state"; fi
   opened=""
   if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
     while read -r proto ports; do
+      if ufw status 2>/dev/null | awk '{print $1}' | grep -qx "$ports/$proto"; then continue; fi
       ufw allow "$ports/$proto" >/dev/null 2>&1 && echo "ufw $proto $ports" >> "$fw_state"
     done < "$W/fw.txt"
     opened="$opened ufw"
@@ -457,6 +557,7 @@ if [ "$FW" = 1 ] && [ -s "$W/fw.txt" ]; then
   if has firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
     while read -r proto ports; do
       p=$(echo "$ports" | tr ':' '-')
+      if firewall-cmd --permanent --query-port="$p/$proto" >/dev/null 2>&1; then continue; fi
       firewall-cmd --permanent --add-port="$p/$proto" >/dev/null 2>&1 && echo "firewalld $proto $p" >> "$fw_state"
     done < "$W/fw.txt"
     firewall-cmd --reload >/dev/null 2>&1
@@ -466,49 +567,25 @@ if [ "$FW" = 1 ] && [ -s "$W/fw.txt" ]; then
     for t in iptables ip6tables; do
       has $t || continue
       $t -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)' || continue
+      added=0
       while read -r proto ports; do
-        $t -C INPUT -p "$proto" --dport "$ports" -m comment --comment aio-proxy -j ACCEPT 2>/dev/null \
-          || $t -I INPUT -p "$proto" --dport "$ports" -m comment --comment aio-proxy -j ACCEPT 2>/dev/null \
-          && echo "$t $proto $ports" >> "$fw_state"
+        if $t -C INPUT -p "$proto" --dport "$ports" -m comment --comment aio-proxy -j ACCEPT 2>/dev/null \
+           || $t -I INPUT -p "$proto" --dport "$ports" -m comment --comment aio-proxy -j ACCEPT 2>/dev/null; then
+          echo "$t $proto $ports" >> "$fw_state"; added=1
+        fi
       done < "$W/fw.txt"
-      opened="$opened $t"
+      if [ $added = 1 ]; then opened="$opened $t"; else warn "$t 规则添加失败（内核可能缺少 comment 模块），请手动放行端口"; fi
     done
     if has nft && nft list chain inet filter input >/dev/null 2>&1 && ! echo "$opened" | grep -q iptables; then
+      added=0
       while read -r proto ports; do
         p=$(echo "$ports" | tr ':' '-')
         nft insert rule inet filter input "$proto" dport "$p" accept comment \"aio-proxy\" 2>/dev/null \
-          && echo "nft $proto $p" >> "$fw_state"
+          && echo "nft $proto $p" >> "$fw_state" && added=1
       done < "$W/fw.txt"
-      opened="$opened nftables"
-    fi
-    # 持久化 iptables 规则（尽力而为）
-    if echo "$opened" | grep -q iptables; then
-      if has netfilter-persistent; then netfilter-persistent save >/dev/null 2>&1
-      elif [ -d /etc/iptables ]; then iptables-save > /etc/iptables/rules.v4 2>/dev/null; ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
-      elif [ -f /etc/sysconfig/iptables ]; then iptables-save > /etc/sysconfig/iptables 2>/dev/null
-      fi
+      [ $added = 1 ] && opened="$opened nftables"
     fi
   fi
-  cat > "$OPT/fw-undo.sh" <<'EOF'
-#!/bin/sh
-# 撤销本工具添加的防火墙规则
-S=/etc/aio-proxy/fw.state
-[ -s "$S" ] || exit 0
-reload_fwd=0
-while read -r kind proto ports; do
-  case $kind in
-    ufw) ufw delete allow "$ports/$proto" >/dev/null 2>&1 ;;
-    firewalld) firewall-cmd --permanent --remove-port="$ports/$proto" >/dev/null 2>&1; reload_fwd=1 ;;
-    iptables|ip6tables) $kind -D INPUT -p "$proto" --dport "$ports" -m comment --comment aio-proxy -j ACCEPT 2>/dev/null ;;
-    nft) h=$(nft -a list chain inet filter input 2>/dev/null | grep 'comment "aio-proxy"' | grep "dport $ports " | sed -n 's/.*# handle //p' | head -n1)
-         [ -n "$h" ] && nft delete rule inet filter input handle "$h" 2>/dev/null ;;
-  esac
-done < "$S"
-[ $reload_fwd = 1 ] && firewall-cmd --reload >/dev/null 2>&1
-: > "$S"
-exit 0
-EOF
-  chmod 0755 "$OPT/fw-undo.sh"
   if [ -n "$opened" ]; then ok "已放行:${opened}"; else info "未检测到启用的防火墙，无需放行"; fi
 fi
 
