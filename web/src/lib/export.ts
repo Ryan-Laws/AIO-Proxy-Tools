@@ -95,6 +95,8 @@ export function renderLine(r: ExportRow, o: ExportOptions): string {
       return [r.server, scheme, p.public || p.listen, p.port, p.user, p.pass, p.listen, r.egress, testText(r)].map(csvCell).join(",");
     case "template":
       return (o.template || DEFAULT_TEMPLATE)
+        // 无认证代理：去掉整段 "{user}:{pass}@"，避免导出 socks5://:@host:port
+        .replace(/\{user\}:\{pass\}@/g, auth ? `${auth}@` : "")
         .replace(/\{ip\}/g, p.public || p.listen)
         .replace(/\{host\}/g, host)
         .replace(/\{port\}/g, String(p.port))

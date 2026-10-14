@@ -4,7 +4,6 @@
 #   → 停止/启动服务 → SSE 事件 → 卸载 → 删除；另检查令牌与 Host 头防护。
 set -euo pipefail
 mode=$1
-here=$(cd "$(dirname "$0")" && pwd)
 data=$(mktemp -d)
 log=$data/ui.log
 IPS='["10.200.0.1","10.200.0.2","10.200.0.3"]'
@@ -37,7 +36,7 @@ wait_task() { # taskId
     sleep 1
   done
   jq -r '.logs[]? | "  \(.level)\t\(.text)"' <<<"$t" | tail -n 40
-  [ "$st" = done ] || fail "任务 $1 结束状态 $st：$(jq -r .error <<<"$t")"
+  [ "$st" = "done" ] || fail "任务 $1 结束状态 $st：$(jq -r .error <<<"$t")"
 }
 srv() { api GET /api/servers | jq --arg id "$SID" '.[] | select(.id == $id)'; }
 

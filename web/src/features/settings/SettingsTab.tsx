@@ -74,6 +74,8 @@ export function SettingsTab({ s, busy }: { s: ServerView; busy: boolean }) {
     if (editsEntry && editsEntry.key !== planKey) setEdits(s.id, null);
   }, [editsEntry, planKey, s.id]);
 
+  // 预览表里手改过的清单也交给后端校验（端口占用、账号规则等以后端为准）
+  const editsJSON = edits ? JSON.stringify(edits) : "";
   React.useEffect(() => {
     if (!s.info) return;
     if (!selection.length) {
@@ -81,11 +83,14 @@ export function SettingsTab({ s, busy }: { s: ServerView; busy: boolean }) {
       setPlanErr("");
       return;
     }
-    if (hasErrors) return;
+    if (hasErrors) {
+      setPlan(null);
+      return;
+    }
     let stale = false;
     setLoading(true);
     api
-      .plan(s.id, { settings: draft, selected: selection, edited: null })
+      .plan(s.id, { settings: draft, selected: selection, edited: edits })
       .then((r) => {
         if (stale) return;
         setPlan(r);
@@ -96,8 +101,8 @@ export function SettingsTab({ s, busy }: { s: ServerView; busy: boolean }) {
     return () => {
       stale = true;
     };
-    // 只在防抖后的 key 变化时请求
-    }, [debKey, s.id, !!s.info]);
+    // 只在防抖后的 key、手改内容或探测结果（重新探测后端口占用、公网地址可能变化）变化时请求
+    }, [debKey, editsJSON, s.id, s.info?.detectedAt]);
 
   const proxies = edits ?? plan?.proxies ?? [];
   const planErrors = [...(plan?.errors ?? []), ...(planErr ? [planErr] : [])];

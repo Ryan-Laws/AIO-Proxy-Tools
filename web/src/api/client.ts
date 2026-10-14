@@ -24,9 +24,18 @@ import type {
 const TOKEN_KEY = "aio-token";
 
 function detectMock(): boolean {
-  const q = new URLSearchParams(location.search).get("mock");
+  const params = new URLSearchParams(location.search);
+  const q = params.get("mock");
   if (q === "1" || q === "empty" || q === "demo") return true;
-  if (q === "0") return false;
+  // 带令牌打开（程序启动时打开的真实地址）一律进入真实模式，并清除之前记住的演示标记
+  if (q === "0" || params.get("t")) {
+    try {
+      sessionStorage.removeItem("aio-mock");
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
   try {
     if (sessionStorage.getItem("aio-mock") === "1") return true;
   } catch {

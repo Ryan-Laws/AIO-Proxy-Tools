@@ -20,7 +20,7 @@ export function ManualAddDialog({ open, onOpenChange, serverId }: { open: boolea
   }, [open]);
 
   const items = text
-    .split(/[\n,;，；]+/)
+    .split(/[\s,;，；]+/)
     .map((x) => x.trim().replace(/\s*-\s*/, "-"))
     .filter(Boolean);
   const bad = items.filter((x) => !isValidAddrSpec(x));

@@ -37,7 +37,7 @@ export function VaultDialog({
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (mode === "create") {
-      if (pw.length < 6) return setErr(t("vault.tooShort"));
+      if (pw.length < 8) return setErr(t("vault.tooShort"));
       if (pw !== pw2) return setErr(t("vault.mismatch"));
     }
     setBusy(true);

@@ -13,7 +13,7 @@ fw=${3:-none}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 aio=$root/aio
-name=aio-e2e
+name="aio-e2e"
 work=$(mktemp -d)
 data=$work/data
 ECHO=198.18.0.1            # 回显服务器：非内网地址，代理默认允许访问
@@ -32,7 +32,13 @@ dump() {
   inct 'ls -la /etc/aio-proxy /opt/aio-proxy /opt/aio-proxy/bin 2>&1; cat /etc/aio-proxy/3proxy.cfg 2>&1 | head -n 60' || true
   inct 'ss -ltnup 2>/dev/null || netstat -ltnup 2>/dev/null' || true
 }
-trap 'rc=$?; [ $rc -ne 0 ] && dump; docker rm -f $name >/dev/null 2>&1 || true; exit $rc' EXIT
+cleanup() {
+  local rc=$?
+  [ $rc -ne 0 ] && dump
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  exit $rc
+}
+trap cleanup EXIT
 
 # ------------------------------------------------------------------ 镜像
 say "构建 $image 测试镜像（$login_mode，防火墙 $fw）"

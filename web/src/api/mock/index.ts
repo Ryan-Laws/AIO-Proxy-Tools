@@ -626,7 +626,7 @@ function route(method: string, path: string, body: Record<string, unknown>): unk
     const pw = String(body?.password ?? "");
     if (b === "create") {
       if (vault.exists) throw httpErr(400, "保险箱已存在");
-      if (pw.length < 6) throw httpErr(400, "主密码至少 6 位");
+      if (pw.length < 8) throw httpErr(400, "主密码至少 8 位");
       Object.assign(vault, { exists: true, unlocked: true, password: pw });
     } else if (b === "unlock") {
       if (!vault.exists) throw httpErr(400, "保险箱不存在");

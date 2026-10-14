@@ -120,6 +120,12 @@ export function applyEvent(e: ServerEvent) {
     case "server": {
       const v = e.server;
       if (!v) return;
+      // 服务器的任务已结束（taskId 清空或换了），但本地仍显示运行中：说明漏掉了 task 事件
+      // （SSE 重连、订阅拥塞丢事件），主动拉一次最终状态和完整日志
+      const oldTask = get().servers[v.id]?.taskId;
+      if (oldTask && oldTask !== v.taskId && get().tasks[oldTask]?.state === "running") {
+        void syncTask(oldTask);
+      }
       set((s) => ({
         servers: { ...s.servers, [v.id]: v },
         order: s.order.includes(v.id) ? s.order : [...s.order, v.id],
@@ -152,6 +158,24 @@ export function applyEvent(e: ServerEvent) {
       set((s) => ({ logs: { ...s.logs, [id]: [...(s.logs[id] ?? []), line] } }));
       return;
     }
+  }
+}
+
+async function syncTask(id: string) {
+  try {
+    const tk = await api.task(id);
+    if (tk.state === "running") return;
+    const { logs, ...rest } = tk;
+    set((s) => ({
+      tasks: { ...s.tasks, [id]: { ...s.tasks[id], ...rest, logs: undefined } },
+      logs: logs ? { ...s.logs, [id]: logs } : s.logs,
+    }));
+    if (seenRunning.has(id)) {
+      seenRunning.delete(id);
+      onTaskFinished(tk);
+    }
+  } catch {
+    /* 任务可能已被清理，忽略 */
   }
 }
 

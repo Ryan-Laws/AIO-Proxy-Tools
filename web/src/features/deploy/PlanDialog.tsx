@@ -26,9 +26,18 @@ export function validateRows(rows: Proxy[], requireAuth: boolean): RowErr[] {
       errs[seen.get(k)!].port = t("plan.errDup");
     } else seen.set(k, i);
     if (requireAuth || r.user || r.pass) {
-      if (!r.user || !NAME_RE.test(r.user)) errs[i].user = t("plan.errChar");
+      if (!r.user || !NAME_RE.test(r.user) || r.user.length > 64) errs[i].user = t("plan.errChar");
       if (!r.pass || !NAME_RE.test(r.pass)) errs[i].pass = t("plan.errChar");
+      else if (r.pass.length < 6 || r.pass.length > 64) errs[i].pass = t("val.passLen");
     }
+  });
+  // 同一用户名只能对应一个密码（3proxy 的账号表按用户名区分）
+  const passOf = new Map<string, string>();
+  rows.forEach((r, i) => {
+    if (!r.user) return;
+    const p = passOf.get(r.user);
+    if (p === undefined) passOf.set(r.user, r.pass);
+    else if (p !== r.pass) errs[i].pass = t("plan.errSameUser");
   });
   return errs;
 }

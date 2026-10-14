@@ -51,11 +51,12 @@ export function validateSettings(s: Settings, texts: { whitelist: string; list: 
   if (s.auth.mode === "custom") {
     if (!s.auth.user || !NAME_RE.test(s.auth.user)) e.user = t("set.auth.charset");
     if (!s.auth.pass || !NAME_RE.test(s.auth.pass)) e.pass = t("set.auth.charset");
+    else if (s.auth.pass.length < 6 || s.auth.pass.length > 64) e.pass = t("val.passLen");
   }
   if (s.auth.mode === "per" || s.auth.mode === "shared") {
     if (s.auth.userPrefix && !NAME_RE.test(s.auth.userPrefix)) e.prefix = t("set.auth.charset");
     if (!(s.auth.userLen >= 4 && s.auth.userLen <= 32)) e.userLen = "4-32";
-    if (!(s.auth.passLen >= 6 && s.auth.passLen <= 64)) e.passLen = "6-64";
+    if (!(s.auth.passLen >= 8 && s.auth.passLen <= 64)) e.passLen = "8-64";
   }
   if (s.auth.mode === "list") {
     const bad = parseCredLines(texts.list).bad;
@@ -64,13 +65,14 @@ export function validateSettings(s: Settings, texts: { whitelist: string; list: 
   }
   const wlBad = splitList(texts.whitelist).filter((x) => !isValidCidrOrIP(x));
   if (wlBad.length) e.whitelist = t("set.whitelistBad", { list: wlBad.slice(0, 4).join("、") });
+  else if (s.auth.mode === "none" && !s.whitelist?.length) e.whitelist = t("val.noAuthWhitelist");
   if (s.dns.mode === "forward" || s.dns.mode === "public" || s.dns.mode === "custom") {
     const list = splitList(texts.dns);
     const bad = list.filter((x) => !isValidIP(x));
     if (!list.length) e.dns = t("val.dnsEmpty");
     else if (bad.length) e.dns = t("val.badFormat", { list: bad.slice(0, 4).join("、") });
   }
-  if (s.githubMirror && !/^https?:\/\/\S+$/.test(s.githubMirror)) e.mirror = t("val.mirror");
+  if (s.githubMirror && !/^https:\/\/[A-Za-z0-9.-]+(:\d{1,5})?(\/\S*)?$/.test(s.githubMirror)) e.mirror = t("val.mirror");
   if (s.limits.expiresAt && !/^\d{4}-\d{2}-\d{2}$/.test(s.limits.expiresAt)) e.expires = t("val.date");
   return e;
 }
@@ -82,7 +84,7 @@ export function parseCredLines(text: string) {
     const line = raw.trim();
     if (!line) return;
     const m = line.match(/^([^:\s]+)[:\s,]+(\S+)$/);
-    if (!m || !NAME_RE.test(m[1]) || !NAME_RE.test(m[2])) bad.push(i + 1);
+    if (!m || !NAME_RE.test(m[1]) || !NAME_RE.test(m[2]) || m[1].length > 64 || m[2].length < 6 || m[2].length > 64) bad.push(i + 1);
     else list.push({ user: m[1], pass: m[2] });
   });
   return { list, bad };
@@ -258,7 +260,7 @@ export function SettingsForm({
               <NumberInput id="auth-ulen" value={s.auth.userLen} min={4} max={32} onChange={(v) => upAuth({ userLen: Math.round(v) })} />
             </Field>
             <Field label={t("set.auth.passLen")} htmlFor="auth-plen" error={errors.passLen}>
-              <NumberInput id="auth-plen" value={s.auth.passLen} min={6} max={64} onChange={(v) => upAuth({ passLen: Math.round(v) })} />
+              <NumberInput id="auth-plen" value={s.auth.passLen} min={8} max={64} onChange={(v) => upAuth({ passLen: Math.round(v) })} />
             </Field>
             <p className="col-span-3 -mt-1 text-xs text-muted-foreground">
               {t("set.auth.example", {
