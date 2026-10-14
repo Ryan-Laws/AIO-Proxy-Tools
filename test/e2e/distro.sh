@@ -56,7 +56,9 @@ case "$image" in
     [ "$fw" = ufw ] && setup="$setup && apt-get install -y -qq ufw >/dev/null" ;;
   *rockylinux*|*almalinux*|fedora:*|*centos*)
     init=/usr/sbin/init
-    setup="dnf install -y -q systemd openssh-server sudo iproute procps-ng passwd >/dev/null && systemctl enable sshd"
+    # 测试容器里 RHEL 系的 PAM account 阶段会拒绝所有登录（容器开机状态不完整），测试镜像里关掉 sshd 的 PAM
+    setup="dnf install -y -q systemd openssh-server sudo iproute procps-ng passwd >/dev/null && systemctl enable sshd \
+      && sed -i 's/^UsePAM.*/UsePAM no/' /etc/ssh/sshd_config && grep -rl '^UsePAM' /etc/ssh/sshd_config.d 2>/dev/null | xargs -r sed -i 's/^UsePAM.*/UsePAM no/'"
     [ "$fw" = firewalld ] && setup="$setup && dnf install -y -q firewalld >/dev/null && systemctl enable firewalld" ;;
   opensuse/*)
     init=/usr/lib/systemd/systemd
@@ -102,7 +104,7 @@ RUN ssh-keygen -A \\
  && mkdir -p /root/.ssh && chmod 700 /root/.ssh \\
  && echo 'root:$SUDO_PW' | chpasswd \\
  && printf 'PermitRootLogin prohibit-password\nPasswordAuthentication yes\nKbdInteractiveAuthentication yes\n' > /tmp/sshd_extra \\
- && if [ -d /etc/ssh/sshd_config.d ]; then cp /tmp/sshd_extra /etc/ssh/sshd_config.d/00-e2e.conf; else cat /tmp/sshd_extra >> /etc/ssh/sshd_config; fi \\
+ && if grep -q '^Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config; then cp /tmp/sshd_extra /etc/ssh/sshd_config.d/00-e2e.conf; else sed -i '1r /tmp/sshd_extra' /etc/ssh/sshd_config; fi \\
  && useradd -m -s /bin/sh aio 2>/dev/null || adduser -D -s /bin/sh aio \\
  && echo 'aio:$SUDO_PW' | chpasswd \\
  && mkdir -p /etc/sudoers.d && echo 'aio ALL=(ALL) ALL' > /etc/sudoers.d/aio && chmod 0440 /etc/sudoers.d/aio
